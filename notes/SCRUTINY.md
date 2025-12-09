@@ -194,9 +194,8 @@ Design vs implementation:
 **Key risks and concrete issues**
 
 1. **Scheduler over-aggressiveness for slow gauges**
-   - `schedule_next_poll` never schedules beyond `now + max_retry_seconds` (`streamvis.py:979`–`983`), even when the learned cadence is much longer.
-   - This can produce much more frequent polling than the true cadence for slow-updating stations, contradicting the “~1 call per update” objective in `README.md:51`–`55`.
-   - Risk: unnecessary API load and conceptual mismatch with the documented behavior.
+   - (Original) `schedule_next_poll` never scheduled beyond `now + max_retry_seconds` (`streamvis.py:979`–`983`), even when the learned cadence is much longer, which could produce much more frequent polling than the true cadence for slow-updating stations, contradicting the “~1 call per update” objective in `README.md:51`–`55`.
+   - Resolution: normal scheduling now ignores `max_retry_seconds` and is driven solely by `mean_interval_sec` (clamped) and latency stats; `--max-retry-seconds` is reserved for error backoff. In addition, once at least three update intervals have been observed for a gauge, if the learned mean interval remains significantly shorter than the empirical average of those intervals, we snap the mean upward toward that average so slow gauges (e.g., hourly) converge quickly to their true cadence even when starting from an 8‑minute prior.
 
 2. **Fine-window polling rate vs documented guardrail**
    - Fine windows can poll every 5 seconds (`FINE_STEP_MIN_SEC` in `streamvis.py:15` and logic at `streamvis.py:935`–`947`).

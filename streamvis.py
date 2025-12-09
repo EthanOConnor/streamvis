@@ -820,6 +820,19 @@ def update_state_with_readings(
             deltas.append(last_delta)
             if len(deltas) > HISTORY_LIMIT:
                 del deltas[0 : len(deltas) - HISTORY_LIMIT]
+
+            # If we have accumulated enough intervals and our learned mean
+            # is still significantly shorter than the typical observed delta,
+            # snap the mean upward toward the empirical average. This prevents
+            # slow-updating gauges (e.g., hourly) from being biased for too
+            # long by the short initial prior.
+            if len(deltas) >= 3:
+                avg_delta = sum(deltas) / len(deltas)
+                mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
+                if isinstance(mean_interval, (int, float)) and mean_interval < 0.75 * avg_delta:
+                    mean_interval = max(MIN_UPDATE_GAP_SEC, min(avg_delta, MAX_LEARNABLE_INTERVAL_SEC))
+                    g_state["mean_interval_sec"] = mean_interval
+
             # Latency window: when did this observation appear in the API?
             # Lower bound: last poll where it was *not* yet visible.
             # Upper bound: this poll where it *is* visible.

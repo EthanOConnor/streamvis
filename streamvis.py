@@ -1344,7 +1344,7 @@ def tui_loop(args: argparse.Namespace) -> int:
         if footer_y >= 0:
             next_multi = _fmt_rel(now, next_poll_at) if next_poll_at else "pending"
             footer = (
-                "[↑/↓] select  [Enter] details  [c] toggle chart metric  [r] refresh now  [q] quit  "
+                "[↑/↓] select  [Enter] details  [c] toggle chart metric  [r] refresh  [f] force refetch  [q] quit  "
                 f"Next fetch: {next_multi}  |  {status_msg}"
             )
             stdscr.addstr(footer_y, 0, footer[:max_x - 1], palette.get("dim", 0))
@@ -1436,9 +1436,12 @@ def tui_loop(args: argparse.Namespace) -> int:
             elif key in (ord("c"), ord("C")):
                 chart_metric = "flow" if chart_metric == "stage" else "stage"
                 status_msg = f"Chart metric: {chart_metric}"
-            elif key in (ord("r"), ord("R")):
+            elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
                 next_poll_at = datetime.now(timezone.utc)
-                status_msg = "Manual refresh requested..."
+                if key in (ord("f"), ord("F")):
+                    status_msg = "Forced refetch requested..."
+                else:
+                    status_msg = "Manual refresh requested..."
 
         return 0
 

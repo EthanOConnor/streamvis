@@ -55,3 +55,8 @@
 - Updated `update_state_with_readings` to:
   - Record `last_poll_ts` even when no new observation is seen so latency windows can use the last “no-update” poll as their lower bound on the next successful update.
   - Track a `no_update_polls` counter per gauge to persist how many consecutive polls have seen no change, making “no-change” information available cross-session for future heuristics.
+
+## 2025-12-10 – TUI forced refetch key
+
+- Added an `f` keybinding in TUI mode that, like `r`, schedules an immediate fetch but is labeled as a “forced refetch” to make it obvious the user is re-querying USGS even if the last observation timestamp has not advanced.
+- Updated the footer help text and README TUI section to advertise `f` alongside `r`, clarifying that both trigger a fresh network call and re-parse of stage/flow regardless of whether the upstream update time changed.

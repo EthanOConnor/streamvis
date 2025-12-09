@@ -126,7 +126,7 @@ streamvis --mode tui  # optional: --chart-metric flow
 ```
 
 - Arrow keys / `j`/`k` to select a station; selected row highlights.
-- `c` toggles the chart metric between stage and flow; `r` forces a refresh; `q` quits.
+- `c` toggles the chart metric between stage and flow; `r` requests an immediate refresh; `f` forces an immediate refetch even if the last observation time has not advanced; `q` quits.
 - Detail pane shows the selected station’s last reading, when it was observed, per-gauge next expected update, and a sparkline of recent history (lightweight, persisted in state).
 - The loop reuses the adaptive cadence learner to keep requests near 1 call per new update.
 - State also records last fetch/success/failure timestamps and learned intervals across runs so the TUI stays conservative even after restart.

@@ -1092,13 +1092,11 @@ def tui_loop(args: argparse.Namespace) -> int:
             f"Now {local_now.strftime('%Y-%m-%d %H:%M:%S %Z')} | "
             f"{now.strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
-        sub_line = f"Mode: TUI adaptive | State: {args.state_file}"
 
         stdscr.addstr(0, 0, title[:max_x - 1], curses.A_BOLD | palette.get("title", 0))
         stdscr.addstr(1, 0, clock_line[:max_x - 1], palette.get("normal", 0))
-        stdscr.addstr(2, 0, sub_line[:max_x - 1], palette.get("dim", 0))
 
-        table_start = 4
+        table_start = 3
         header = (
             f"{'Gauge':<6} "
             f"{'Stage(ft)':>9} "
@@ -1300,6 +1298,11 @@ def tui_loop(args: argparse.Namespace) -> int:
                 f"Next fetch: {next_multi}  |  {status_msg}"
             )
             stdscr.addstr(footer_y, 0, footer[:max_x - 1], palette.get("dim", 0))
+
+        info_y = footer_y + 1
+        if 0 <= info_y < max_y:
+            info_line = f"Mode: TUI adaptive | State: {args.state_file}"
+            stdscr.addstr(info_y, 0, info_line[:max_x - 1], palette.get("dim", 0))
 
         stdscr.refresh()
 

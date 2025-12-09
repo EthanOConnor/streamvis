@@ -62,7 +62,17 @@ async function loadPythonModule(pyodide, path) {
     throw new Error(`Failed to load ${path}: ${resp.status} ${resp.statusText}`);
   }
   const src = await resp.text();
-  await pyodide.runPythonAsync(src);
+
+  // Derive module name from the filename (e.g., "../http_client.py" → "http_client").
+  const parts = path.split("/");
+  const filename = parts[parts.length - 1];
+  const moduleName = filename.endsWith(".py") ? filename.slice(0, -3) : filename;
+
+  // Install the module into Pyodide's virtual filesystem so that normal
+  // `import moduleName` works, matching how streamvis imports http_client
+  // and web_entrypoint imports streamvis.
+  pyodide.FS.writeFile(filename, src, { encoding: "utf8" });
+  await pyodide.runPythonAsync(`import ${moduleName}`);
 }
 
 async function syncStateFromLocalStorage(pyodide) {

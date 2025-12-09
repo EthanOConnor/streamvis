@@ -49,7 +49,23 @@
 - Forecast/state hygiene:
   - Stored forecast points are trimmed to a window around “now” based on the configured horizon to avoid stale peaks and unbounded state growth before running bias/phase calculations.
 - Configuration source of truth:
-  - `config.toml` mirrors USGS URLs, station metadata, and thresholds now hard-coded in `streamvis.py`. We should either declare code as authoritative for the moment or wire config loading soon to avoid drift and make future station additions safer.
+  - `config.toml` initially mirrored USGS URLs, station metadata, and thresholds hard-coded in `streamvis.py`. We have now wired a minimal TOML loader so that:
+    - Station bindings (`gauge_id` → `usgs_site_no`) and the primary USGS IV base URL are read from `config.toml` when present.
+    - Built-in Snoqualmie defaults remain as a fallback when `config.toml` is missing or incomplete, so the tool still runs out of the box.
+    - Forecast configuration in `config.toml` (per-station `forecast_endpoint` and a global `default_forecast_template`) is honored when non-empty, but CLI `--forecast-base` continues to override config.
+
+## 2025-12-10 – Browser TUI architecture (Pyodide + web_curses)
+
+- We now support running the existing curses-based TUI directly in a browser using Pyodide and a small compatibility layer:
+  - HTTP is routed through a new `http_client` abstraction:
+    - Native CPython uses `requests` under the hood (preserving current behavior).
+    - Pyodide uses `pyodide.http.open_url`, relying on browser `fetch` and CORS for USGS/NWPS/NWRFC endpoints.
+  - Curses is abstracted via `web_curses`, which implements just the subset of the curses API that `tui_loop` uses and renders into a `<div id="terminal">` in the DOM.
+  - A small `web_entrypoint` module launches the TUI in `--mode tui` with a fixed `--state-file` pointing at `streamvis_state.json` so that JS can bridge it to `localStorage`.
+- Design intent:
+  - Keep `streamvis.py` as the single source of truth for scheduler behavior and TUI layout; the browser build is a thin shell that swaps out HTTP and terminal backends.
+  - Make the browser path completely static-host friendly (e.g., GitHub Pages) by loading Pyodide from a CDN and serving only static assets (HTML/JS/Python).
+  - Persist adaptive state across browser sessions by syncing the chosen state file to `localStorage` on boot/exit; this means mobile users see the same learned cadences the CLI would, as long as they occasionally quit the TUI to flush state back.
 
 ## 2025-12-10 – No-update polls and history usage
 

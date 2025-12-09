@@ -168,13 +168,11 @@ Design vs implementation:
 
 **Config & extensibility**
 
-- `config.toml:1`–`40` is present but not wired:
-  - It contains authoritative station metadata, USGS base URLs, and placeholders for NOAA IDs and endpoints.
-  - The `stations.CRNW1` block matches `SITE_MAP`’s `CRNW1` gauge id, which is consistent.
-- This file is currently purely aspirational and could easily drift from the hard-coded constants in `streamvis.py` (`SITE_MAP`, `USGS_IV_URL`, `FLOOD_THRESHOLDS`).
-- A future refactor to load `SITE_MAP`, thresholds, and forecast endpoints from `config.toml` would:
-  - Reduce duplication.
-  - Make it much easier to add/rename stations or tweak flood thresholds without editing code.
+- `config.toml:1`–`40` contains authoritative station metadata, USGS base URLs, and placeholders for NOAA IDs and endpoints.
+  - A minimal TOML loader in `streamvis.py` now reads this file when present.
+  - Station bindings (`gauge_id` → `usgs_site_no`) and the primary USGS IV base URL are taken from `config.toml` when available, falling back to the hard-coded Snoqualmie defaults otherwise.
+  - Forecast configuration in `config.toml` (per-station `forecast_endpoint` and `[global.noaa_nwps].default_forecast_template`) is honored when non-empty, while CLI `--forecast-base` remains the highest-precedence override.
+- This wiring reduces duplication and keeps station additions/changes in config, but `FLOOD_THRESHOLDS` are still code-only for now; moving thresholds into config is a possible future refinement.
 
 **Style, types, and maintainability**
 
@@ -225,7 +223,20 @@ Design vs implementation:
 - Fix the TUI trend bug by always defining `dh` even when no stage data is present (`streamvis.py:1218`–`1224`).
 - Unify “Next ETA” semantics between CLI and TUI so “ago” never appears in a field labelled “next” (`render_table` vs `draw_screen`).
 - Add a simple trimming step for forecast points similar to `HISTORY_LIMIT` to bound memory (`update_forecast_state`).
-- Longer term: wire `config.toml` into `SITE_MAP`, `USGS_IV_URL`, and forecast URLs, and introduce a small test harness to exercise `update_state_with_readings` + `schedule_next_poll` under synthetic cadences and latencies.
+- Longer term: finish wiring `config.toml` into any remaining code-only knobs (e.g., flood thresholds) and introduce a small test harness to exercise `update_state_with_readings` + `schedule_next_poll` under synthetic cadences and latencies.
+
+**Browser/Pages deployment considerations (Pyodide build)**
+
+- The Pyodide + `web_curses` path keeps the core TUI logic in `streamvis.py` but swaps:
+  - HTTP through `http_client` (requests vs `pyodide.http.open_url`), and
+  - The terminal backend through a thin curses shim that draws into the DOM.
+- Risks / checks:
+  - Verify that USGS/NWRFC/NWPS endpoints required for the browser build are consistently CORS-enabled for direct browser access.
+  - Confirm that the fixed canvas size in `web_curses.initscr` (rows/cols) is sufficient for typical mobile/desktop viewports and that overflow is at worst clipped, not mis-rendered.
+  - Ensure localStorage state syncing (`streamvis_state.json` ↔ `streamvis_state_json`) is robust to first-run (no file) and very large state files; consider trimming or compressing if the browser state grows.
+- Validation ideas:
+  - Smoke-test the GitHub Pages build in Chrome/Firefox/Safari, including mobile, to ensure keyboard input, redraw, and state persistence behave as expected.
+  - When adding future features, keep the curses surface area small so that the `web_curses` shim stays easy to maintain and reason about.
 
 ## 2025-12-10 – Meta scrutinizer refinement
 

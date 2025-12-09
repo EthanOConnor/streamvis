@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-import requests
+from http_client import get_json, get_text
 
 STATE_FILE_DEFAULT = Path.home() / ".streamvis_state.json"
 # Start with a conservative 8-minute cadence and only speed up if
@@ -35,16 +35,125 @@ FINE_STEP_MAX_SEC = 30           # Maximum fine-mode poll step.
 COARSE_STEP_FRACTION = 0.5       # Coarse step ~ fraction of mean interval.
 COARSE_STEP_MAX_SEC = 5 * 60     # Do not coarse-poll more often than this.
 
-# USGS gauge IDs for the Snoqualmie system we care about.
+CONFIG_PATH = Path(__file__).with_name("config.toml")
 
-SITE_MAP = {
+
+def _parse_toml_value(raw: str) -> Any:
+    """
+    Minimal TOML value parser for the subset used in config.toml.
+    Supports strings, integers, floats, and booleans.
+    """
+    raw = raw.strip()
+    if not raw:
+        return ""
+    if raw[0] == raw[-1] == '"':
+        inner = raw[1:-1]
+        return inner.replace(r"\\", "\\").replace(r"\"", "\"").replace(r"\n", "\n")
+    lowered = raw.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        if any(ch in raw for ch in (".", "e", "E")):
+            return float(raw)
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _load_toml_config(path: Path) -> Dict[str, Any]:
+    """
+    Minimal, dependency-free TOML loader tailored to this project's config.toml.
+    It understands:
+      - Comment lines starting with '#'
+      - Section headers like [section] or [a.b]
+      - Simple key = value pairs where value is a scalar.
+    Any parse error results in an empty config so the runtime can fall back
+    to built-in defaults.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+
+    root: Dict[str, Any] = {}
+    current: Dict[str, Any] = root
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            if not section:
+                # Skip invalid section headers.
+                current = root
+                continue
+            parts = [p.strip() for p in section.split(".") if p.strip()]
+            current = root
+            for part in parts:
+                child = current.setdefault(part, {})
+                if not isinstance(child, dict):
+                    # Conflicting types; give up on this section.
+                    child = {}
+                current = child
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        current[key] = _parse_toml_value(value)
+
+    return root
+
+
+CONFIG: Dict[str, Any] = _load_toml_config(CONFIG_PATH)
+
+# Built-in defaults for USGS plumbing; config.toml can override these.
+DEFAULT_SITE_MAP: Dict[str, str] = {
     "TANW1": "12141300",  # Middle Fork Snoqualmie R near Tanner
     "GARW1": "12143400",  # SF Snoqualmie R ab Alice Cr nr Garcia
     "SQUW1": "12144500",  # Snoqualmie R near Snoqualmie
     "CRNW1": "12149000",  # Snoqualmie R near Carnation
 }
 
-USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
+DEFAULT_USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
+
+
+def _site_map_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
+    stations = cfg.get("stations")
+    if not isinstance(stations, dict):
+        return {}
+    site_map: Dict[str, str] = {}
+    for key, entry in stations.items():
+        if not isinstance(entry, dict):
+            continue
+        gauge_id = entry.get("gauge_id") or key
+        site_no = entry.get("usgs_site_no")
+        if isinstance(gauge_id, str) and isinstance(site_no, str) and site_no:
+            site_map[gauge_id] = site_no
+    return site_map
+
+
+def _usgs_iv_url_from_config(cfg: Dict[str, Any]) -> str:
+    global_cfg = cfg.get("global")
+    if isinstance(global_cfg, dict):
+        usgs_cfg = global_cfg.get("usgs")
+        if isinstance(usgs_cfg, dict):
+            base = usgs_cfg.get("iv_base_url")
+            if isinstance(base, str) and base:
+                return base
+    return DEFAULT_USGS_IV_URL
+
+
+# USGS gauge IDs for the Snoqualmie system we care about.
+SITE_MAP: Dict[str, str] = _site_map_from_config(CONFIG) or DEFAULT_SITE_MAP
+
+USGS_IV_URL = _usgs_iv_url_from_config(CONFIG)
 
 # Optional NW RFC text-plot endpoint used for cross-checking observed
 # stage/flow for selected stations. We treat USGS IV as authoritative
@@ -197,9 +306,7 @@ def fetch_gauge_data() -> Dict[str, Dict[str, Any]]:
     }
 
     try:
-        resp = requests.get(USGS_IV_URL, params=params, timeout=5.0)
-        resp.raise_for_status()
-        payload = resp.json()
+        payload = get_json(USGS_IV_URL, params=params, timeout=5.0)
     except Exception:
         # Network / JSON issue; show nothing but fail gracefully.
         return {}
@@ -357,9 +464,7 @@ def fetch_gauge_history(hours_back: int) -> Dict[str, List[Dict[str, Any]]]:
     }
 
     try:
-        resp = requests.get(USGS_IV_URL, params=params, timeout=10.0)
-        resp.raise_for_status()
-        payload = resp.json()
+        payload = get_json(USGS_IV_URL, params=params, timeout=10.0)
     except Exception:
         return {}
 
@@ -518,6 +623,37 @@ def _resolve_forecast_url(template: str, gauge_id: str, site_no: str) -> str:
     return template.format(gauge_id=gauge_id, site_no=site_no)
 
 
+def _forecast_template_for_gauge(gauge_id: str, site_no: str, args: argparse.Namespace) -> str:
+    """
+    Resolve a forecast URL template for a given gauge, honoring:
+    - CLI --forecast-base (highest precedence, shared across gauges)
+    - Per-station forecast_endpoint in config.toml
+    - Global default_forecast_template in config.toml
+    Returns an empty string when no forecast configuration is available.
+    """
+    base = getattr(args, "forecast_base", "") or ""
+    if base:
+        return base
+
+    stations_cfg = CONFIG.get("stations")
+    if isinstance(stations_cfg, dict):
+        entry = stations_cfg.get(gauge_id)
+        if isinstance(entry, dict):
+            endpoint = entry.get("forecast_endpoint")
+            if isinstance(endpoint, str) and endpoint:
+                return endpoint
+
+    global_cfg = CONFIG.get("global")
+    if isinstance(global_cfg, dict):
+        nwps_cfg = global_cfg.get("noaa_nwps")
+        if isinstance(nwps_cfg, dict):
+            template = nwps_cfg.get("default_forecast_template")
+            if isinstance(template, str) and template:
+                return template
+
+    return ""
+
+
 def fetch_forecast_series(
     forecast_base: str,
     gauge_id: str,
@@ -543,9 +679,7 @@ def fetch_forecast_series(
         params["horizon_hours"] = horizon_hours
 
     try:
-        resp = requests.get(url, params=params or None, timeout=10.0)
-        resp.raise_for_status()
-        data = resp.json()
+        data = get_json(url, params=params or None, timeout=10.0)
     except Exception:
         return []
 
@@ -830,11 +964,8 @@ def update_forecast_state(
 def maybe_refresh_forecasts(state: Dict[str, Any], args: argparse.Namespace) -> None:
     """
     Refresh forecasts for all gauges at most once per FORECAST_REFRESH_MIN minutes.
+    Forecasts can be enabled via CLI (--forecast-base) or config.toml.
     """
-    base = getattr(args, "forecast_base", "") or ""
-    if not base:
-        return
-
     now = datetime.now(timezone.utc)
     meta = state.setdefault("meta", {})
     last_fetch_raw = meta.get("last_forecast_fetch")
@@ -844,8 +975,21 @@ def maybe_refresh_forecasts(state: Dict[str, Any], args: argparse.Namespace) -> 
         if age_sec < FORECAST_REFRESH_MIN * 60:
             return
 
+    # Skip quickly if no gauge has any forecast configuration.
+    any_configured = False
     for gauge_id, site_no in SITE_MAP.items():
-        points = fetch_forecast_series(base, gauge_id, site_no, args.forecast_hours)
+        template = _forecast_template_for_gauge(gauge_id, site_no, args)
+        if template:
+            any_configured = True
+            break
+    if not any_configured:
+        return
+
+    for gauge_id, site_no in SITE_MAP.items():
+        template = _forecast_template_for_gauge(gauge_id, site_no, args)
+        if not template:
+            continue
+        points = fetch_forecast_series(template, gauge_id, site_no, args.forecast_hours)
         if points:
             update_forecast_state(state, gauge_id, points, now=now, horizon_hours=args.forecast_hours)
 
@@ -928,9 +1072,7 @@ def maybe_refresh_nwrfc(state: Dict[str, Any], args: argparse.Namespace) -> None
     for gauge_id, nwrfc_id in NWRFC_ID_MAP.items():
         params = {"id": nwrfc_id, "pe": "HG", "bt": "on"}
         try:
-            resp = requests.get(NWRFC_TEXT_BASE, params=params, timeout=10.0)
-            resp.raise_for_status()
-            text = resp.text
+            text = get_text(NWRFC_TEXT_BASE, params=params, timeout=10.0)
         except Exception:
             continue
         series = parse_nwrfc_text(text)
@@ -1324,6 +1466,10 @@ def tui_loop(args: argparse.Namespace) -> int:
 
     gauges = sorted(SITE_MAP.keys())
 
+    # Row index where the table header is drawn; gauge rows start at
+    # TUI_TABLE_START + 1. This is shared with the web click/tap mapping.
+    TUI_TABLE_START = 3
+
     def color_for_status(status: str, palette: Dict[str, int]) -> int:
         status = (status or "").upper()
         if "MAJOR" in status:
@@ -1353,7 +1499,7 @@ def tui_loop(args: argparse.Namespace) -> int:
         stdscr.addstr(0, 0, title[:max_x - 1], curses.A_BOLD | palette.get("title", 0))
         stdscr.addstr(1, 0, clock_line[:max_x - 1], palette.get("normal", 0))
 
-        table_start = 3
+        table_start = TUI_TABLE_START
         header = (
             f"{'Gauge':<6} "
             f"{'Stage(ft)':>9} "
@@ -1654,6 +1800,23 @@ def tui_loop(args: argparse.Namespace) -> int:
             key = stdscr.getch()
             if key in (ord("q"), ord("Q")):
                 return 0
+            # Synthetic click/tap support from the web shim:
+            # keys in the range [3000, 4000) mean "click on row N".
+            if 3000 <= key < 4000:
+                clicked_row = key - 3000
+                first_gauge_row = TUI_TABLE_START + 1
+                target = clicked_row - first_gauge_row
+                if 0 <= target < len(gauges):
+                    if target == selected_idx:
+                        # Toggle detail for the currently selected gauge.
+                        detail_mode = not detail_mode
+                    else:
+                        # Select a new gauge and show its detail view.
+                        selected_idx = target
+                        detail_mode = True
+                    status_msg = f"Selected {gauges[selected_idx]} (tap/click to toggle detail)"
+                continue
+
             if key in (curses.KEY_UP, ord("k")):
                 selected_idx = (selected_idx - 1) % len(gauges)
             elif key in (curses.KEY_DOWN, ord("j")):

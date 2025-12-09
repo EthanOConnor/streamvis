@@ -31,7 +31,7 @@ python streamvis.py
 
 ## What it does
 
-- Calls the USGS Instantaneous Values service for the gauges defined in `SITE_MAP`.
+- Calls the USGS Instantaneous Values service for the gauges defined in `config.toml` (or the built-in defaults if no config is present).
 - Extracts the most recent stage (ft) and flow (cfs).
 - Classifies each gauge as `NORMAL`, `ACTION`, `MINOR FLOOD`, `MOD FLOOD`, or `MAJOR FLOOD` using `FLOOD_THRESHOLDS`.
 - Prints a compact table to standard output with the observation time and the per-gauge expected next update.
@@ -69,6 +69,16 @@ Options:
 - `--max-retry-seconds` (default 300): ceiling when backing off on errors.
 - `--backfill-hours` (default 0): on startup, optionally backfill this many hours of recent history from USGS IV to seed the cadence learner and charts.
 
+## Configuration (config.toml)
+
+`streamvis` reads station metadata and USGS/NWPS base URLs from `config.toml` in the project/module directory when present:
+
+- `[global.usgs]` defines the USGS IV base URL(s); if omitted, the tool falls back to `https://waterservices.usgs.gov/nwis/iv/`.
+- `[stations.<GAUGE_ID>]` blocks define per-station metadata, including `usgs_site_no` used to build IV queries.
+- `[global.noaa_nwps]` and per-station `forecast_endpoint` fields can supply forecast URL templates; these are only used when non-empty.
+
+If `config.toml` is missing or incomplete, `streamvis` uses its built-in Snoqualmie defaults so it remains runnable out of the box.
+
 ## Forecast integration (optional, via NWPS)
 
 `streamvis` can optionally overlay official river forecasts from NOAA’s National Water Prediction Service (NWPS) when configured with an appropriate API endpoint.
@@ -79,6 +89,12 @@ CLI options:
   - Example template (you must align this with NOAA’s current API docs before use):
     - `--forecast-base 'https://api.water.noaa.gov/.../stations/{gauge_id}/forecast'`
 - `--forecast-hours` (default 72): forecast horizon (in hours) considered when computing peak summaries.
+
+You can also configure a default forecast template and/or per-station `forecast_endpoint` values in `config.toml`. When both are present, precedence is:
+
+1. CLI `--forecast-base`
+2. Per-station `forecast_endpoint` in `config.toml`
+3. `[global.noaa_nwps].default_forecast_template` in `config.toml`
 
 Behavior when enabled:
 
@@ -141,6 +157,22 @@ streamvis --mode tui  # optional: --chart-metric flow
 - State also records last fetch/success/failure timestamps and learned intervals across runs so the TUI stays conservative even after restart.
 
 Note: TUI mode uses Python `curses` (available on macOS/Linux; Windows users may need WSL or an environment with `curses` support).
+
+## Running the TUI in a browser (Pyodide build)
+
+`streamvis` also ships a small browser harness that runs the existing curses TUI inside a web page using Pyodide (Python → WebAssembly) and a minimal `web_curses` shim:
+
+- The core logic in `streamvis.py` is unchanged; only HTTP and curses are abstracted behind `http_client.py` and `web_curses.py`.
+- In the browser, HTTP calls use `pyodide.http.open_url`, so requests go directly from the page to USGS/NWPS/NWRFC with CORS.
+- The TUI draws into a `<div id="terminal">` using `web_curses`, and key events (`q`, arrows, `c`, `r`, `f`, `Enter`) are forwarded from JS into `getch()`.
+- State is persisted between browser sessions by mapping the `--state-file streamvis_state.json` used by the web entrypoint to `localStorage` (`streamvis_state_json`).
+- The browser shim adapts the virtual terminal size to the viewport and lets you tap/click on a station row to select it and toggle its detail/table view, which works well on devices like an iPhone in landscape mode.
+
+To host this on GitHub Pages:
+
+1. Commit `web/index.html` and `web/main.js` along with the Python modules in the repo root (`streamvis.py`, `http_client.py`, `web_curses.py`, `web_entrypoint.py`, `config.toml`).
+2. Configure GitHub Pages to serve the `web/` directory (or copy these files into your chosen Pages root).
+3. Open the Pages URL on your phone or desktop; the page will load Pyodide from a CDN and start `streamvis` in TUI mode inside the browser.
 
 ## Backlog
 

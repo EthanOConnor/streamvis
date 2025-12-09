@@ -72,3 +72,23 @@
 - Implemented `parse_nwrfc_text` to parse observed/forecast stage and discharge from the text output, treating timestamps as PST/PDT and converting them to UTC.
 - Stored parsed series in `state["nwrfc"][gauge_id]` and computed a simple per-timestamp difference vs the latest USGS observation when timestamps align, recording Δstage/Δflow under `diff_vs_usgs`.
 - Extended the TUI expanded detail view to display a concise “NW RFC vs USGS (last)” line when cross-check data is available, so users can see whether the downstream NW RFC view closely matches raw USGS IV.
+
+## 2025-12-10 – Config-driven stations and forecast wiring
+
+- Added a minimal, dependency-free TOML loader in `streamvis.py` that reads `config.toml` when present.
+- Switched `SITE_MAP` and the USGS IV base URL to be derived from `config.toml` (`[stations.*].usgs_site_no` and `[global.usgs].iv_base_url`), with the existing Snoqualmie constants preserved as a fallback when config is missing or incomplete.
+- Updated forecast integration so that, in addition to CLI `--forecast-base`, per-station `forecast_endpoint` values and a global `[global.noaa_nwps].default_forecast_template` in `config.toml` can supply forecast URL templates; CLI still takes precedence.
+- Documented the new configuration behavior in `README.md` and captured the “config as source of truth, code as fallback” decision in `notes/MEMORY.md`.
+
+## 2025-12-10 – Browser TUI via Pyodide (static web harness)
+
+- Introduced `http_client.py` as a thin HTTP abstraction so `streamvis.py` can run both natively (via `requests`) and in a browser (via `pyodide.http.open_url`) without changing its core logic or error-handling semantics.
+- Added `web_curses.py`, a minimal curses shim that draws into a `#terminal` div and consumes key codes from a JS-managed queue, implementing only the small subset of curses APIs actually used by the TUI.
+- Added `web_entrypoint.py` with `run_default()` that launches `streamvis` in `--mode tui` using a local `streamvis_state.json` state file suitable for mapping to browser `localStorage`.
+- Created `web/index.html` and `web/main.js`, which:
+  - Load Pyodide from a CDN.
+  - Load the Python modules (`http_client.py`, `web_curses.py`, `streamvis.py`, `web_entrypoint.py`) into the Pyodide runtime.
+  - Patch `sys.modules["curses"]` to point at `web_curses`.
+  - Bridge `streamvis_state.json` to `localStorage` (`streamvis_state_json`) on startup/shutdown so browser sessions retain adaptive polling state.
+- Updated `README.md` with a “Running the TUI in a browser” section describing the Pyodide-based GitHub Pages flow and the fact that the existing curses TUI runs unchanged inside the browser.
+  - Made the web shim responsive to the actual viewport by deriving rows/cols from the `#terminal` element’s size and font metrics, and added click/tap support on gauge rows by encoding per-row selection/toggle events into synthetic key codes consumed by `tui_loop`.

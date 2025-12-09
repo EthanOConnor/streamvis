@@ -778,8 +778,26 @@ def update_state_with_readings(
             # No new point; keep existing cadence and history as-is.
             seen_updates[gauge_id] = False
             # Still keep last known values in sync with the latest reading.
-            g_state["last_stage"] = reading.get("stage")
-            g_state["last_flow"] = reading.get("flow")
+            stage_now = reading.get("stage")
+            flow_now = reading.get("flow")
+            g_state["last_stage"] = stage_now
+            g_state["last_flow"] = flow_now
+
+            # If this reading shares the same timestamp as our last stored
+            # point (e.g., one parameter was updated slightly later by USGS),
+            # refresh the last history entry so the table reflects the
+            # latest stage/flow pair rather than freezing the older value.
+            if prev_ts is not None and observed_at == prev_ts:
+                history = g_state.get("history")
+                if isinstance(history, list) and history:
+                    last_entry = history[-1]
+                    ts_str = last_entry.get("ts")
+                    if isinstance(ts_str, str) and _parse_timestamp(ts_str) == observed_at:
+                        if stage_now is not None:
+                            last_entry["stage"] = stage_now
+                        if flow_now is not None:
+                            last_entry["flow"] = flow_now
+
             g_state["no_update_polls"] = int(no_update_polls) + 1
             # Record the time of this poll so future latency windows can use it
             # as the last "no-update" bound.

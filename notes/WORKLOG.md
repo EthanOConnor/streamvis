@@ -60,3 +60,8 @@
 
 - Added an `f` keybinding in TUI mode that, like `r`, schedules an immediate fetch but is labeled as a “forced refetch” to make it obvious the user is re-querying USGS even if the last observation timestamp has not advanced.
 - Updated the footer help text and README TUI section to advertise `f` alongside `r`, clarifying that both trigger a fresh network call and re-parse of stage/flow regardless of whether the upstream update time changed.
+
+## 2025-12-10 – Same-timestamp parameter updates
+
+- Noticed that USGS sometimes updates stage and flow for a gauge at the same observation timestamp but at slightly different times, leading to a temporary mismatch where history showed a repeated flow value even after stage updated.
+- Updated `update_state_with_readings` so that when a new fetch has the same `observed_at` as the last stored point but different stage/flow, the last history entry for that timestamp is refreshed in place; cadence/latency learning still only advances on strictly newer timestamps.

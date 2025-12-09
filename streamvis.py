@@ -17,15 +17,23 @@ STATE_FILE_DEFAULT = Path.home() / ".streamvis_state.json"
 # Start with a conservative 8-minute cadence and only speed up if
 # the data clearly updates more frequently.
 DEFAULT_INTERVAL_SEC = 8 * 60
-MIN_RETRY_SEC = 60              # Short retry when we were early or on error.
-MAX_RETRY_SEC = 5 * 60          # Cap retry wait to avoid hammering.
-HEADSTART_SEC = 30              # Poll slightly before expected update.
-EWMA_ALPHA = 0.30               # How quickly to learn update cadence.
-HISTORY_LIMIT = 120             # Keep a small rolling window of observations.
-UI_TICK_SEC = 0.15              # UI refresh tick for TUI mode.
-MIN_UPDATE_GAP_SEC = 60         # Ignore sub-60-second deltas when learning cadence.
-FORECAST_REFRESH_MIN = 60       # Do not refetch forecasts more often than this.
+MIN_RETRY_SEC = 60               # Short retry when we were early or on error.
+MAX_RETRY_SEC = 5 * 60           # Cap retry wait to avoid hammering.
+HEADSTART_SEC = 30               # Poll slightly before expected update.
+EWMA_ALPHA = 0.30                # How quickly to learn update cadence.
+HISTORY_LIMIT = 120              # Keep a small rolling window of observations.
+UI_TICK_SEC = 0.15               # UI refresh tick for TUI mode.
+MIN_UPDATE_GAP_SEC = 60          # Ignore sub-60-second deltas when learning cadence.
+FORECAST_REFRESH_MIN = 60        # Do not refetch forecasts more often than this.
 MAX_LEARNABLE_INTERVAL_SEC = 6 * 3600  # Do not learn cadences longer than 6 hours.
+
+# Fine/coarse polling control for adaptive scheduling.
+FINE_LATENCY_MAD_MAX_SEC = 60    # Only micro-poll if latency MAD <= 1 minute.
+FINE_WINDOW_MIN_SEC = 30         # Minimum half-width of fine window.
+FINE_STEP_MIN_SEC = 5            # Minimum fine-mode poll step.
+FINE_STEP_MAX_SEC = 30           # Maximum fine-mode poll step.
+COARSE_STEP_FRACTION = 0.5       # Coarse step ~ fraction of mean interval.
+COARSE_STEP_MAX_SEC = 5 * 60     # Do not coarse-poll more often than this.
 
 # USGS gauge IDs for the Snoqualmie system we care about.
 
@@ -278,11 +286,20 @@ def _cleanup_state(state: Dict[str, Any]) -> None:
         # Clamp any stored latency stats.
         latencies = g_state.get("latencies_sec")
         if isinstance(latencies, list):
-            latencies = [float(x) for x in latencies if isinstance(x, (int, float)) and x >= 0]
-            if latencies:
-                g_state["latencies_sec"] = latencies[-HISTORY_LIMIT:]
+            clean_lat = [float(x) for x in latencies if isinstance(x, (int, float)) and x >= 0]
+            if clean_lat:
+                g_state["latencies_sec"] = clean_lat[-HISTORY_LIMIT:]
             else:
                 g_state.pop("latencies_sec", None)
+
+        for key in ("latency_lower_sec", "latency_upper_sec"):
+            vals = g_state.get(key)
+            if isinstance(vals, list):
+                clean = [float(x) for x in vals if isinstance(x, (int, float)) and x >= 0]
+                if clean:
+                    g_state[key] = clean[-HISTORY_LIMIT:]
+                else:
+                    g_state.pop(key, None)
 
 
 def fetch_gauge_history(hours_back: int) -> Dict[str, List[Dict[str, Any]]]:
@@ -710,7 +727,11 @@ def maybe_refresh_forecasts(state: Dict[str, Any], args: argparse.Namespace) -> 
     meta["last_forecast_fetch"] = now.isoformat()
 
 
-def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
+def update_state_with_readings(
+    state: Dict[str, Any],
+    readings: Dict[str, Dict[str, Any]],
+    poll_ts: datetime | None = None,
+) -> Dict[str, bool]:
     """
     Update persisted state with latest observations and learn per-gauge cadence.
     Returns a dict of gauge_id -> bool indicating whether a new observation was seen.
@@ -718,7 +739,7 @@ def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[s
     seen_updates: Dict[str, bool] = {}
     gauges_state = state.setdefault("gauges", {})
     meta_state = state.setdefault("meta", {})
-    now = datetime.now(timezone.utc)
+    now = poll_ts or datetime.now(timezone.utc)
 
     for gauge_id, reading in readings.items():
         observed_at: datetime | None = reading.get("observed_at")
@@ -728,6 +749,7 @@ def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[s
 
         g_state = gauges_state.setdefault(gauge_id, {})
         prev_ts = _parse_timestamp(g_state.get("last_timestamp"))
+        prev_poll_ts = _parse_timestamp(g_state.get("last_poll_ts"))
         prev_mean = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
         last_delta = g_state.get("last_delta_sec")
         is_update = False
@@ -776,34 +798,52 @@ def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[s
             deltas.append(last_delta)
             if len(deltas) > HISTORY_LIMIT:
                 del deltas[0 : len(deltas) - HISTORY_LIMIT]
+            # Latency window: when did this observation appear in the API?
+            # Lower bound: last poll where it was *not* yet visible.
+            # Upper bound: this poll where it *is* visible.
+            lower = 0.0
+            if prev_poll_ts is not None:
+                lower = max(0.0, (prev_poll_ts - observed_at).total_seconds())
+            upper = max(0.0, (now - observed_at).total_seconds())
 
-            # Latency: when did this observation appear in the API?
-            latency_sec = (now - observed_at).total_seconds()
-            if latency_sec >= 0:
-                latencies = g_state.setdefault("latencies_sec", [])
-                latencies.append(latency_sec)
-                if len(latencies) > HISTORY_LIMIT:
-                    del latencies[0 : len(latencies) - HISTORY_LIMIT]
+            lat_l = g_state.setdefault("latency_lower_sec", [])
+            lat_u = g_state.setdefault("latency_upper_sec", [])
+            lat_l.append(lower)
+            lat_u.append(upper)
+            if len(lat_l) > HISTORY_LIMIT:
+                del lat_l[0 : len(lat_l) - HISTORY_LIMIT]
+            if len(lat_u) > HISTORY_LIMIT:
+                del lat_u[0 : len(lat_u) - HISTORY_LIMIT]
 
-                # Robust location/scale: median and MAD.
-                values = sorted(latencies)
-                n = len(values)
-                if n:
+            # Use the midpoints as our primary latency samples.
+            midpoints = g_state.setdefault("latencies_sec", [])
+            mid = 0.5 * (lower + upper)
+            midpoints.append(mid)
+            if len(midpoints) > HISTORY_LIMIT:
+                del midpoints[0 : len(midpoints) - HISTORY_LIMIT]
+
+            # Robust location/scale (median and MAD) on midpoints.
+            values = sorted(midpoints)
+            n = len(values)
+            if n:
+                if n % 2 == 1:
+                    median = values[n // 2]
+                else:
+                    median = 0.5 * (values[n // 2 - 1] + values[n // 2])
+                devs = [abs(v - median) for v in values]
+                devs.sort()
+                if devs:
                     if n % 2 == 1:
-                        median = values[n // 2]
+                        mad = devs[n // 2]
                     else:
-                        median = 0.5 * (values[n // 2 - 1] + values[n // 2])
-                    devs = [abs(v - median) for v in values]
-                    devs.sort()
-                    if devs:
-                        if n % 2 == 1:
-                            mad = devs[n // 2]
-                        else:
-                            mad = 0.5 * (devs[n // 2 - 1] + devs[n // 2])
-                    else:
-                        mad = 0.0
-                    g_state["latency_median_sec"] = median
-                    g_state["latency_mad_sec"] = mad
+                        mad = 0.5 * (devs[n // 2 - 1] + devs[n // 2])
+                else:
+                    mad = 0.0
+                g_state["latency_median_sec"] = median
+                g_state["latency_mad_sec"] = mad
+
+        # Record the time of this poll for future latency windows.
+        g_state["last_poll_ts"] = now.isoformat()
 
         seen_updates[gauge_id] = is_update
 
@@ -813,24 +853,11 @@ def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[s
 
 
 def predict_next_poll(state: Dict[str, Any], now: datetime) -> datetime:
-    gauges_state = state.get("gauges", {})
-    candidates = []
-    for gauge_id in SITE_MAP.keys():
-        g_state = gauges_state.get(gauge_id, {})
-        last_ts = _parse_timestamp(g_state.get("last_timestamp"))
-        mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-        mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
-        if last_ts is None:
-            last_ts = now
-        candidates.append(last_ts + timedelta(seconds=mean_interval))
-
-    if not candidates:
-        return now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
-
-    target = min(candidates) - timedelta(seconds=HEADSTART_SEC)
-    if target < now:
-        return now + timedelta(seconds=MIN_UPDATE_GAP_SEC)
-    return target
+    """
+    Legacy helper retained for compatibility; delegates to the
+    more sophisticated scheduler that is aware of latency windows.
+    """
+    return schedule_next_poll(state, now, MIN_RETRY_SEC, MAX_RETRY_SEC)
 
 
 def predict_gauge_next(state: Dict[str, Any], gauge_id: str, now: datetime) -> datetime | None:
@@ -859,6 +886,103 @@ def predict_gauge_next(state: Dict[str, Any], gauge_id: str, now: datetime) -> d
         latency_med = 0.0
 
     return next_obs + timedelta(seconds=latency_med)
+
+
+def schedule_next_poll(
+    state: Dict[str, Any],
+    now: datetime,
+    min_retry_seconds: int,
+    max_retry_seconds: int,
+) -> datetime:
+    """
+    Choose the next time to poll USGS IV, using:
+    - Per-gauge observation cadence (mean_interval_sec)
+    - Per-gauge latency stats (median & MAD)
+    - A two-regime strategy:
+      * Coarse polling far from the expected update time.
+      * Short bursts of finer polling inside a narrow latency window
+        for gauges with stable, low-variance latency.
+    """
+    gauges_state = state.get("gauges", {})
+    if not isinstance(gauges_state, dict) or not gauges_state:
+        return now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
+
+    best_time: datetime | None = None
+
+    for gauge_id in SITE_MAP.keys():
+        g_state = gauges_state.get(gauge_id, {})
+        if not isinstance(g_state, dict):
+            continue
+
+        last_ts = _parse_timestamp(g_state.get("last_timestamp"))
+        mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
+        if last_ts is None or not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
+            continue
+
+        mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
+        next_api = predict_gauge_next(state, gauge_id, now)
+        if next_api is None:
+            continue
+
+        latency_mad = g_state.get("latency_mad_sec")
+        fine_eligible = (
+            isinstance(latency_mad, (int, float))
+            and latency_mad > 0
+            and latency_mad <= FINE_LATENCY_MAD_MAX_SEC
+            and mean_interval <= 3600
+        )
+
+        if fine_eligible:
+            lat_width = max(FINE_WINDOW_MIN_SEC, 2.0 * float(latency_mad))
+            fine_start = next_api - timedelta(seconds=lat_width)
+            fine_end = next_api + timedelta(seconds=lat_width)
+
+            if fine_start <= now <= fine_end:
+                # Inside the fine window: poll more frequently, but only as
+                # fast as the latency stability justifies.
+                fine_step = max(
+                    FINE_STEP_MIN_SEC,
+                    min(FINE_STEP_MAX_SEC, lat_width / 4.0),
+                )
+                candidate = now + timedelta(seconds=fine_step)
+            else:
+                # Coarse region around a known fine window: walk towards it.
+                coarse_step = max(
+                    min_retry_seconds,
+                    min(COARSE_STEP_MAX_SEC, mean_interval * COARSE_STEP_FRACTION),
+                )
+                target = fine_start if now < fine_start else next_api
+                candidate = max(
+                    now + timedelta(seconds=min_retry_seconds),
+                    min(target - timedelta(seconds=HEADSTART_SEC), now + timedelta(seconds=coarse_step)),
+                )
+        else:
+            # No stable latency yet: use a simple coarse strategy around
+            # the predicted next API time.
+            coarse_step = max(
+                min_retry_seconds,
+                min(COARSE_STEP_MAX_SEC, mean_interval * COARSE_STEP_FRACTION),
+            )
+            candidate = max(
+                now + timedelta(seconds=min_retry_seconds),
+                min(next_api - timedelta(seconds=HEADSTART_SEC), now + timedelta(seconds=coarse_step)),
+            )
+
+        if candidate <= now:
+            candidate = now + timedelta(seconds=min_retry_seconds)
+        if best_time is None or candidate < best_time:
+            best_time = candidate
+
+    if best_time is None:
+        best_time = now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
+
+    # Do not schedule unreasonably far in the future during normal operation.
+    max_horizon = max_retry_seconds if max_retry_seconds > 0 else MAX_LEARNABLE_INTERVAL_SEC
+    latest_allowed = now + timedelta(seconds=max_horizon)
+    if best_time > latest_allowed:
+        best_time = latest_allowed
+
+    return best_time
 
 
 def _history_values(state: Dict[str, Any], gauge_id: str, metric: str, limit: int = HISTORY_LIMIT) -> List[float]:
@@ -1191,12 +1315,15 @@ def tui_loop(args: argparse.Namespace) -> int:
                 if fetched:
                     readings = fetched
                     retry_wait = args.min_retry_seconds
-                    update_state_with_readings(state, readings)
+                    update_state_with_readings(state, readings, poll_ts=now)
                     maybe_refresh_forecasts(state, args)
                     save_state(state_path, state)
-                    next_poll_at = predict_next_poll(state, now)
-                    if next_poll_at <= now:
-                        next_poll_at = now + timedelta(seconds=args.min_retry_seconds)
+                    next_poll_at = schedule_next_poll(
+                        state,
+                        datetime.now(timezone.utc),
+                        args.min_retry_seconds,
+                        args.max_retry_seconds,
+                    )
                     status_msg = f"Fetched at {_fmt_clock(now)}; next {_fmt_rel(now, next_poll_at)}"
                     state["meta"]["last_success_at"] = now.isoformat()
                     state["meta"]["next_poll_at"] = next_poll_at.isoformat()
@@ -1241,12 +1368,14 @@ def adaptive_loop(args: argparse.Namespace) -> int:
     next_poll_at: datetime | None = None
 
     while True:
-        if next_poll_at:
-            sleep_for = max(0, (next_poll_at - datetime.now(timezone.utc)).total_seconds())
+        now = datetime.now(timezone.utc)
+        if next_poll_at and next_poll_at > now:
+            sleep_for = max(0.0, (next_poll_at - now).total_seconds())
             if sleep_for:
                 time.sleep(sleep_for)
+            now = datetime.now(timezone.utc)
 
-        state.setdefault("meta", {})["last_fetch_at"] = datetime.now(timezone.utc).isoformat()
+        state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
         readings = fetch_gauge_data()
         if not readings:
             time.sleep(min(args.max_retry_seconds, retry_wait))
@@ -1258,7 +1387,7 @@ def adaptive_loop(args: argparse.Namespace) -> int:
             continue
 
         retry_wait = args.min_retry_seconds
-        updates = update_state_with_readings(state, readings)
+        updates = update_state_with_readings(state, readings, poll_ts=now)
         maybe_refresh_forecasts(state, args)
         save_state(state_path, state)
 
@@ -1274,9 +1403,12 @@ def adaptive_loop(args: argparse.Namespace) -> int:
             continue
 
         now = datetime.now(timezone.utc)
-        next_poll_at = predict_next_poll(state, now)
-        if next_poll_at <= now:
-            next_poll_at = now + timedelta(seconds=args.min_retry_seconds)
+        next_poll_at = schedule_next_poll(
+            state,
+            now,
+            args.min_retry_seconds,
+            args.max_retry_seconds,
+        )
         state["meta"]["last_success_at"] = now.isoformat()
         state["meta"]["next_poll_at"] = next_poll_at.isoformat()
         save_state(state_path, state)
@@ -1356,7 +1488,7 @@ def main(argv: list[str] | None = None) -> int:
         print("No data available from USGS Instantaneous Values service.", file=sys.stderr)
         return 1
 
-    update_state_with_readings(state, data)
+    update_state_with_readings(state, data, poll_ts=datetime.now(timezone.utc))
     maybe_refresh_forecasts(state, args)
     save_state(state_path, state)
     render_table(data, state)

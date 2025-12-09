@@ -54,6 +54,15 @@ Behavior:
 - Persisted state lives at `~/.streamvis_state.json` (override with `--state-file PATH`). Only the last timestamps, learned intervals, and last values are stored—no heavy history.
 - Learning has sensible floors/ceilings: sub-60-second deltas are ignored when learning cadence, and learned intervals are clamped to a reasonable range before scheduling the next fetch.
 
+Latency-aware scheduling:
+
+- For each station, `streamvis` tracks:
+  - Observation cadence (seconds between gauge timestamps).
+  - Observation→API latency as a window (lower/upper bounds) and robust stats (median, MAD).
+- The scheduler uses a two-regime strategy:
+  - Coarse polling while far from the expected next update (fraction of the learned interval, capped).
+  - Short bursts of finer polling inside a narrow latency window for stations whose latency is stable (small MAD), to converge on update timing at second-level resolution without hammering the API.
+
 Options:
 
 - `--min-retry-seconds` (default 60): retry delay if the prediction was early.

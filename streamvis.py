@@ -1021,7 +1021,14 @@ def _render_sparkline(values: List[float], width: int = 48) -> str:
 
 def render_table(readings: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> None:
     now = datetime.now(timezone.utc)
-    header = "Gauge   Stage(ft)   Flow(cfs)   Status         Observed    Next ETA"
+    header = (
+        f"{'Gauge':<6} "
+        f"{'Stage(ft)':>9} "
+        f"{'Flow(cfs)':>10} "
+        f"{'Status':<12} "
+        f"{'Observed':>9} "
+        f"{'Next ETA':>9}"
+    )
     print(header)
     print("-" * len(header))
 
@@ -1036,12 +1043,19 @@ def render_table(readings: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> 
         observed_at = reading.get("observed_at") or _parse_timestamp(g_state.get("last_timestamp"))
         next_eta = predict_gauge_next(state, gauge_id, now)
 
-        stage_str = f"{stage:.2f}" if isinstance(stage, (int, float)) else "-"
-        flow_str = f"{int(flow):d}" if isinstance(flow, (int, float)) else "-"
+        stage_str = f"{stage:.2f}" if isinstance(stage, (int, float)) else "--"
+        flow_str = f"{int(flow):d}" if isinstance(flow, (int, float)) else "--"
         obs_str = _fmt_clock(observed_at)
         next_str = _fmt_rel(now, next_eta) if next_eta and next_eta >= now else "now"
 
-        print(f"{gauge_id:6s} {stage_str:>9s} {flow_str:>10s}   {status:<12s} {obs_str:>10s}   {next_str}")
+        print(
+            f"{gauge_id:<6s} "
+            f"{stage_str:>9s} "
+            f"{flow_str:>10s} "
+            f"{status:<12s} "
+            f"{obs_str:>9s} "
+            f"{next_str:>9s}"
+        )
 
 
 def tui_loop(args: argparse.Namespace) -> int:
@@ -1085,7 +1099,14 @@ def tui_loop(args: argparse.Namespace) -> int:
         stdscr.addstr(2, 0, sub_line[:max_x - 1], palette.get("dim", 0))
 
         table_start = 4
-        header = "Gauge  Stage(ft)  Flow(cfs)  Status       Observed   Next ETA"
+        header = (
+            f"{'Gauge':<6} "
+            f"{'Stage(ft)':>9} "
+            f"{'Flow(cfs)':>10} "
+            f"{'Status':<11} "
+            f"{'Observed':>9} "
+            f"{'Next ETA':>9}"
+        )
         stdscr.addstr(table_start, 0, header[:max_x - 1], curses.A_UNDERLINE | palette.get("normal", 0))
 
         for row, gauge_id in enumerate(gauges, start=table_start + 1):
@@ -1106,7 +1127,14 @@ def tui_loop(args: argparse.Namespace) -> int:
             obs_str = _fmt_clock(observed_at)
             next_str = _fmt_rel(now, next_eta)
 
-            line = f"{gauge_id:5s}  {stage_str:>8s}  {flow_str:>8s}  {status:<11s} {obs_str:>9s}  {next_str:>8s}"
+            line = (
+                f"{gauge_id:<6s} "
+                f"{stage_str:>9s} "
+                f"{flow_str:>10s} "
+                f"{status:<11s} "
+                f"{obs_str:>9s} "
+                f"{next_str:>9s}"
+            )
             color = color_for_status(status, palette)
 
             if gauge_id == gauges[selected_idx]:
@@ -1141,7 +1169,13 @@ def tui_loop(args: argparse.Namespace) -> int:
                 recent = history[-6:]
                 table_y = detail_y + 3
                 if table_y < max_y - 2:
-                    header_line = "Recent updates (local)   Stage   ΔStage   Flow   ΔFlow"
+                    header_line = (
+                        f"{'Time':>8}  "
+                        f"{'Stage':>8} "
+                        f"{'ΔStage':>8} "
+                        f"{'Flow':>8} "
+                        f"{'ΔFlow':>8}"
+                    )
                     stdscr.addstr(table_y, 0, header_line[:max_x - 1], palette.get("dim", 0))
                     prev_stage = None
                     prev_flow = None
@@ -1158,11 +1192,11 @@ def tui_loop(args: argparse.Namespace) -> int:
                         df = flow_v - prev_flow if isinstance(flow_v, (int, float)) and isinstance(prev_flow, (int, float)) else None
                         prev_stage = stage_v
                         prev_flow = flow_v
-                        stage_str = f"{stage_v:6.2f}" if isinstance(stage_v, (int, float)) else "   -- "
-                        ds_str = f"{ds:+6.2f}" if isinstance(ds, (int, float)) else "   -- "
-                        flow_str = f"{int(flow_v):6d}" if isinstance(flow_v, (int, float)) else "   -- "
-                        df_str = f"{int(df):+6d}" if isinstance(df, (int, float)) else "   -- "
-                        line = f"{ts_str:>8s}   {stage_str}  {ds_str}  {flow_str}  {df_str}"
+                        stage_str = f"{stage_v:8.2f}" if isinstance(stage_v, (int, float)) else "      --"
+                        ds_str = f"{ds:+8.2f}" if isinstance(ds, (int, float)) else "      --"
+                        flow_str = f"{int(flow_v):8d}" if isinstance(flow_v, (int, float)) else "      --"
+                        df_str = f"{int(df):+8d}" if isinstance(df, (int, float)) else "      --"
+                        line = f"{ts_str:>8s}  {stage_str} {ds_str} {flow_str} {df_str}"
                         stdscr.addstr(row_y, 0, line[:max_x - 1], palette.get("chart", 0))
                         row_y += 1
 

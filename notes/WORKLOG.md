@@ -19,3 +19,12 @@
 - Extended the TUI detail view (Enter on a station) to show:
   - A table of the last ~6 updates with per-update stage/flow deltas and trend per hour.
   - Forecast peak summaries and “vs forecast now” metrics when forecast data is available.
+
+## 2025-12-09 – Latency-window scheduler and TUI polish
+
+- Implemented per-update latency windows (lower/upper bounds) and midpoints, with robust median/MAD per gauge.
+- Replaced the simple next-poll logic with a latency-aware scheduler that:
+  - Uses coarse polling far from expected updates.
+  - Uses short bursts of finer polling inside a narrow latency window for stations with stable latency.
+- Updated the TUI to display latency stats per station in the expanded detail view.
+- Improved column alignment for the main table and recent-updates table for better readability.

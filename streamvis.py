@@ -900,8 +900,19 @@ def predict_gauge_next(state: Dict[str, Any], gauge_id: str, now: datetime) -> d
     # Predict the next observation time.
     delta_since_last = (now - last_ts).total_seconds()
     if delta_since_last <= 0:
+        # We are viewing the world at or before the last observation timestamp;
+        # the next observation is one cadence step ahead.
+        next_obs = last_ts + timedelta(seconds=mean_interval)
+    elif delta_since_last <= 2 * mean_interval:
+        # We are within roughly one cadence interval of the last observation.
+        # Do not "skip" the next expected update just because we are slightly
+        # late relative to the nominal cadence; assume the immediate next
+        # observation is still pending.
         next_obs = last_ts + timedelta(seconds=mean_interval)
     else:
+        # We are far beyond the last observation; assume we may have missed
+        # one or more intervals (e.g., the process was offline) and advance
+        # by enough whole intervals that the next prediction lies in the future.
         multiples = max(1, math.ceil(delta_since_last / mean_interval))
         next_obs = last_ts + timedelta(seconds=mean_interval * multiples)
 

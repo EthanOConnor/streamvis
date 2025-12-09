@@ -18,7 +18,7 @@ STATE_FILE_DEFAULT = Path.home() / ".streamvis_state.json"
 # the data clearly updates more frequently.
 DEFAULT_INTERVAL_SEC = 8 * 60
 MIN_RETRY_SEC = 60               # Short retry when we were early or on error.
-MAX_RETRY_SEC = 5 * 60           # Cap retry wait to avoid hammering.
+MAX_RETRY_SEC = 5 * 60           # Cap retry wait when backing off on errors.
 HEADSTART_SEC = 30               # Poll slightly before expected update.
 EWMA_ALPHA = 0.30                # How quickly to learn update cadence.
 HISTORY_LIMIT = 120              # Keep a small rolling window of observations.
@@ -30,7 +30,7 @@ MAX_LEARNABLE_INTERVAL_SEC = 6 * 3600  # Do not learn cadences longer than 6 hou
 # Fine/coarse polling control for adaptive scheduling.
 FINE_LATENCY_MAD_MAX_SEC = 60    # Only micro-poll if latency MAD <= 1 minute.
 FINE_WINDOW_MIN_SEC = 30         # Minimum half-width of fine window.
-FINE_STEP_MIN_SEC = 5            # Minimum fine-mode poll step.
+FINE_STEP_MIN_SEC = 15           # Minimum fine-mode poll step (keep bursts polite).
 FINE_STEP_MAX_SEC = 30           # Maximum fine-mode poll step.
 COARSE_STEP_FRACTION = 0.5       # Coarse step ~ fraction of mean interval.
 COARSE_STEP_MAX_SEC = 5 * 60     # Do not coarse-poll more often than this.
@@ -236,8 +236,10 @@ def load_state(state_path: Path) -> Dict[str, Any]:
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    with state_path.open("w", encoding="utf-8") as fh:
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2, sort_keys=True)
+    tmp_path.replace(state_path)
 
 
 def _cleanup_state(state: Dict[str, Any]) -> None:
@@ -633,14 +635,29 @@ def update_forecast_state(
     forecast_state = state.setdefault("forecast", {})
     g_forecast = forecast_state.setdefault(gauge_id, {})
 
-    # De-duplicate by timestamp.
+    # De-duplicate by timestamp and trim to a reasonable time window around "now"
+    # so we do not accumulate unbounded forecast history.
     by_ts: Dict[str, Dict[str, Any]] = {}
     for p in points:
         ts = p.get("ts")
         if isinstance(ts, str):
             by_ts[ts] = p
     ordered_ts = sorted(by_ts.keys())
-    g_forecast["points"] = [by_ts[ts] for ts in ordered_ts]
+
+    horizon_sec = horizon_hours * 3600 if horizon_hours > 0 else None
+    trimmed_points: List[Dict[str, Any]] = []
+    for ts in ordered_ts:
+        p = by_ts[ts]
+        dt = _parse_timestamp(ts)
+        if dt is None:
+            continue
+        if horizon_sec is not None:
+            delta = (dt - now).total_seconds()
+            if delta > horizon_sec or delta < -horizon_sec:
+                continue
+        trimmed_points.append(p)
+
+    g_forecast["points"] = trimmed_points
 
     summary = summarize_forecast_points(g_forecast["points"], now=now, horizon_hours=horizon_hours)
     g_forecast["summary"] = summary
@@ -752,6 +769,7 @@ def update_state_with_readings(
         prev_poll_ts = _parse_timestamp(g_state.get("last_poll_ts"))
         prev_mean = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
         last_delta = g_state.get("last_delta_sec")
+        no_update_polls = g_state.get("no_update_polls", 0)
         is_update = False
         delta_sec: float | None = None
 
@@ -762,6 +780,10 @@ def update_state_with_readings(
             # Still keep last known values in sync with the latest reading.
             g_state["last_stage"] = reading.get("stage")
             g_state["last_flow"] = reading.get("flow")
+            g_state["no_update_polls"] = int(no_update_polls) + 1
+            # Record the time of this poll so future latency windows can use it
+            # as the last "no-update" bound.
+            g_state["last_poll_ts"] = now.isoformat()
             continue
 
         if prev_ts is not None and observed_at > prev_ts:
@@ -842,6 +864,9 @@ def update_state_with_readings(
                 g_state["latency_median_sec"] = median
                 g_state["latency_mad_sec"] = mad
 
+            # Reset the consecutive no-update counter now that we saw a new point.
+            g_state["no_update_polls"] = 0
+
         # Record the time of this poll for future latency windows.
         g_state["last_poll_ts"] = now.isoformat()
 
@@ -855,9 +880,9 @@ def update_state_with_readings(
 def predict_next_poll(state: Dict[str, Any], now: datetime) -> datetime:
     """
     Legacy helper retained for compatibility; delegates to the
-    more sophisticated scheduler that is aware of latency windows.
+    latency-aware scheduler.
     """
-    return schedule_next_poll(state, now, MIN_RETRY_SEC, MAX_RETRY_SEC)
+    return schedule_next_poll(state, now, MIN_RETRY_SEC)
 
 
 def predict_gauge_next(state: Dict[str, Any], gauge_id: str, now: datetime) -> datetime | None:
@@ -892,7 +917,6 @@ def schedule_next_poll(
     state: Dict[str, Any],
     now: datetime,
     min_retry_seconds: int,
-    max_retry_seconds: int,
 ) -> datetime:
     """
     Choose the next time to poll USGS IV, using:
@@ -902,6 +926,7 @@ def schedule_next_poll(
       * Coarse polling far from the expected update time.
       * Short bursts of finer polling inside a narrow latency window
         for gauges with stable, low-variance latency.
+    This function governs *normal* cadence; error backoff is handled separately.
     """
     gauges_state = state.get("gauges", {})
     if not isinstance(gauges_state, dict) or not gauges_state:
@@ -975,12 +1000,6 @@ def schedule_next_poll(
 
     if best_time is None:
         best_time = now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
-
-    # Do not schedule unreasonably far in the future during normal operation.
-    max_horizon = max_retry_seconds if max_retry_seconds > 0 else MAX_LEARNABLE_INTERVAL_SEC
-    latest_allowed = now + timedelta(seconds=max_horizon)
-    if best_time > latest_allowed:
-        best_time = latest_allowed
 
     return best_time
 
@@ -1123,7 +1142,7 @@ def tui_loop(args: argparse.Namespace) -> int:
             stage_str = f"{stage:.2f}" if isinstance(stage, (int, float)) else "--"
             flow_str = f"{int(flow):d}" if isinstance(flow, (int, float)) else "--"
             obs_str = _fmt_clock(observed_at)
-            next_str = _fmt_rel(now, next_eta)
+            next_str = _fmt_rel(now, next_eta) if next_eta and next_eta >= now else "now"
 
             line = (
                 f"{gauge_id:<6s} "
@@ -1156,7 +1175,7 @@ def tui_loop(args: argparse.Namespace) -> int:
             )
             timing = (
                 f"Observed {_fmt_clock(observed_at, with_date=False)} ({_fmt_rel(now, observed_at)}), "
-                f"Next ETA: {_fmt_rel(now, next_eta)}"
+                f"Next ETA: {_fmt_rel(now, next_eta) if next_eta and next_eta >= now else 'now'}"
             )
             stdscr.addstr(detail_y, 0, detail[:max_x - 1], palette.get("normal", 0) | curses.A_BOLD)
             stdscr.addstr(detail_y + 1, 0, timing[:max_x - 1], palette.get("normal", 0))
@@ -1208,22 +1227,29 @@ def tui_loop(args: argparse.Namespace) -> int:
                             dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
                             if dt is None:
                                 continue
+                            times.append(dt)
                             s = entry.get("stage")
                             f = entry.get("flow")
                             if isinstance(s, (int, float)):
-                                times.append(dt)
                                 stages.append(float(s))
                             if isinstance(f, (int, float)):
                                 flows.append(float(f))
-                        if times and stages:
-                            dh = (times[-1] - times[0]).total_seconds() / 3600.0 or 1.0
-                            stage_trend = (stages[-1] - stages[0]) / dh
+
+                        if len(times) >= 2:
+                            dh_hours = (times[-1] - times[0]).total_seconds() / 3600.0 or 1.0
+                        else:
+                            dh_hours = 1.0
+
+                        if len(stages) >= 2:
+                            stage_trend = (stages[-1] - stages[0]) / dh_hours
                         else:
                             stage_trend = 0.0
-                        if flows:
-                            flow_trend = (flows[-1] - flows[0]) / max(dh, 1e-6)
+
+                        if len(flows) >= 2:
+                            flow_trend = (flows[-1] - flows[0]) / max(dh_hours, 1e-6)
                         else:
                             flow_trend = 0.0
+
                         trend_line = f"Trend: stage {stage_trend:+.2f} ft/h   flow {flow_trend:+.0f} cfs/h"
                         if row_y < max_y - 2:
                             stdscr.addstr(row_y, 0, trend_line[:max_x - 1], palette.get("dim", 0))
@@ -1359,7 +1385,6 @@ def tui_loop(args: argparse.Namespace) -> int:
                         state,
                         datetime.now(timezone.utc),
                         args.min_retry_seconds,
-                        args.max_retry_seconds,
                     )
                     status_msg = f"Fetched at {_fmt_clock(now)}; next {_fmt_rel(now, next_poll_at)}"
                     state["meta"]["last_success_at"] = now.isoformat()
@@ -1444,7 +1469,6 @@ def adaptive_loop(args: argparse.Namespace) -> int:
             state,
             now,
             args.min_retry_seconds,
-            args.max_retry_seconds,
         )
         state["meta"]["last_success_at"] = now.isoformat()
         state["meta"]["next_poll_at"] = next_poll_at.isoformat()

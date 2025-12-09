@@ -18,6 +18,8 @@
   - Persist per-update latency windows (lower/upper bounds) and their evolution.
   - Auto-tune fine/coarse polling windows based on latency MAD and window width.
   - Expose a concise “control summary” per station (e.g., typical cadence, latency median/MAD, fine-window duty cycle).
+ - Add a small synthetic test harness for the scheduler and cadence learner (e.g., scripted cadences/latencies) and track “calls per real update” to validate the polite-polling envelope.
+ - Introduce lightweight state-file locking (or documented single-writer guarantees) so multiple `streamvis` instances do not silently interleave writes.
 
 ## Longer-term
 

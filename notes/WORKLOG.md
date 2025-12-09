@@ -28,3 +28,30 @@
   - Uses short bursts of finer polling inside a narrow latency window for stations with stable latency.
 - Updated the TUI to display latency stats per station in the expanded detail view.
 - Improved column alignment for the main table and recent-updates table for better readability.
+
+## 2025-12-09 – Central scrutinizer pass (LLM)
+
+- Performed a full-project scrutiny pass over `streamvis.py`, `README.md`, `config.toml`, and all `notes/*.md`.
+- Recorded detailed findings, risks, and recommendations in `notes/SCRUTINY.md` and added meta-level design notes about scheduler semantics, TUI assumptions, and forecast state to `notes/MEMORY.md`.
+
+## 2025-12-10 – Meta scrutinizer pass
+
+- Reviewed central scrutinizer notes and expanded them with prioritized severity, file/line references, and concrete remedies in `notes/SCRUTINY.md`.
+- Added design-memory clarifications about separating normal cadence vs error backoff, fine-window philosophy, forecast trimming, and config authority in `notes/MEMORY.md`.
+
+## 2025-12-10 – Scheduler and TUI hardening (staff engineer)
+
+- Decoupled normal polling cadence from error backoff by updating `schedule_next_poll` to ignore `max_retry_seconds` and rely only on learned intervals/latency; `--max-retry-seconds` now governs error backoff exclusively.
+- Raised the fine-window polling floor to 15 seconds to keep bursty micro-polling polite while still converging on low-latency updates.
+- Fixed the TUI trend calculation bug by deriving a robust time span from recent timestamps and only computing stage/flow trends when there are at least two valid samples, preventing `dh` from being used uninitialized.
+- Aligned “Next ETA” semantics in the TUI with the CLI so past or unknown next times render as `now` rather than “ago …”.
+- Trimmed stored forecast points in `update_forecast_state` to a window around “now” based on the configured horizon to avoid stale peaks and unbounded state growth.
+- Made state writes more robust by writing to a temporary file and atomically renaming it into place, reducing the risk of partial file corruption on crash.
+- Captured remaining follow-ups (scheduler test harness, state locking for multi-writer scenarios) in `notes/BACKLOG.md` and updated `notes/SCRUTINY.md` / `notes/MEMORY.md` to mark addressed items as resolved.
+
+## 2025-12-10 – Synthetic scheduler harness and no-update logging
+
+- Added `scheduler_harness.py`, a small synthetic harness that constructs representative gauge states (fast/slow, stable/variable latency) and prints both per-gauge `predict_gauge_next` times and the global `schedule_next_poll` decision for quick, manual inspection of scheduler behavior.
+- Updated `update_state_with_readings` to:
+  - Record `last_poll_ts` even when no new observation is seen so latency windows can use the last “no-update” poll as their lower bound on the next successful update.
+  - Track a `no_update_polls` counter per gauge to persist how many consecutive polls have seen no change, making “no-change” information available cross-session for future heuristics.

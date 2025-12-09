@@ -21,9 +21,9 @@ MIN_RETRY_SEC = 60              # Short retry when we were early or on error.
 MAX_RETRY_SEC = 5 * 60          # Cap retry wait to avoid hammering.
 HEADSTART_SEC = 30              # Poll slightly before expected update.
 EWMA_ALPHA = 0.30               # How quickly to learn update cadence.
-HISTORY_LIMIT = 120            # Keep a small rolling window of observations.
-UI_TICK_SEC = 0.15             # UI refresh tick for TUI mode.
-MIN_UPDATE_GAP_SEC = 8 * 60     # Ignore sub-8-minute deltas when learning cadence.
+HISTORY_LIMIT = 120             # Keep a small rolling window of observations.
+UI_TICK_SEC = 0.15              # UI refresh tick for TUI mode.
+MIN_UPDATE_GAP_SEC = 60         # Ignore sub-60-second deltas when learning cadence.
 FORECAST_REFRESH_MIN = 60       # Do not refetch forecasts more often than this.
 MAX_LEARNABLE_INTERVAL_SEC = 6 * 3600  # Do not learn cadences longer than 6 hours.
 
@@ -274,6 +274,15 @@ def _cleanup_state(state: Dict[str, Any]) -> None:
             mean_interval = DEFAULT_INTERVAL_SEC
         mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
         g_state["mean_interval_sec"] = mean_interval
+
+        # Clamp any stored latency stats.
+        latencies = g_state.get("latencies_sec")
+        if isinstance(latencies, list):
+            latencies = [float(x) for x in latencies if isinstance(x, (int, float)) and x >= 0]
+            if latencies:
+                g_state["latencies_sec"] = latencies[-HISTORY_LIMIT:]
+            else:
+                g_state.pop("latencies_sec", None)
 
 
 def fetch_gauge_history(hours_back: int) -> Dict[str, List[Dict[str, Any]]]:
@@ -709,6 +718,7 @@ def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[s
     seen_updates: Dict[str, bool] = {}
     gauges_state = state.setdefault("gauges", {})
     meta_state = state.setdefault("meta", {})
+    now = datetime.now(timezone.utc)
 
     for gauge_id, reading in readings.items():
         observed_at: datetime | None = reading.get("observed_at")
@@ -767,6 +777,34 @@ def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[s
             if len(deltas) > HISTORY_LIMIT:
                 del deltas[0 : len(deltas) - HISTORY_LIMIT]
 
+            # Latency: when did this observation appear in the API?
+            latency_sec = (now - observed_at).total_seconds()
+            if latency_sec >= 0:
+                latencies = g_state.setdefault("latencies_sec", [])
+                latencies.append(latency_sec)
+                if len(latencies) > HISTORY_LIMIT:
+                    del latencies[0 : len(latencies) - HISTORY_LIMIT]
+
+                # Robust location/scale: median and MAD.
+                values = sorted(latencies)
+                n = len(values)
+                if n:
+                    if n % 2 == 1:
+                        median = values[n // 2]
+                    else:
+                        median = 0.5 * (values[n // 2 - 1] + values[n // 2])
+                    devs = [abs(v - median) for v in values]
+                    devs.sort()
+                    if devs:
+                        if n % 2 == 1:
+                            mad = devs[n // 2]
+                        else:
+                            mad = 0.5 * (devs[n // 2 - 1] + devs[n // 2])
+                    else:
+                        mad = 0.0
+                    g_state["latency_median_sec"] = median
+                    g_state["latency_mad_sec"] = mad
+
         seen_updates[gauge_id] = is_update
 
     meta_state["last_update_run"] = datetime.now(timezone.utc).isoformat()
@@ -807,15 +845,20 @@ def predict_gauge_next(state: Dict[str, Any], gauge_id: str, now: datetime) -> d
     # Clamp learned interval into the same sane bounds used elsewhere.
     mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
 
-    # Predict the first expected update time that is >= now, assuming a
-    # roughly periodic cadence.
+    # Predict the next observation time.
     delta_since_last = (now - last_ts).total_seconds()
     if delta_since_last <= 0:
-        # We are at or before the last observation; simplest is last + interval.
-        return last_ts + timedelta(seconds=mean_interval)
+        next_obs = last_ts + timedelta(seconds=mean_interval)
+    else:
+        multiples = max(1, math.ceil(delta_since_last / mean_interval))
+        next_obs = last_ts + timedelta(seconds=mean_interval * multiples)
 
-    multiples = max(1, math.ceil(delta_since_last / mean_interval))
-    return last_ts + timedelta(seconds=mean_interval * multiples)
+    # Add a robust latency estimate (time from observation to appearance in API).
+    latency_med = g_state.get("latency_median_sec", 0.0)
+    if not isinstance(latency_med, (int, float)) or latency_med < 0:
+        latency_med = 0.0
+
+    return next_obs + timedelta(seconds=latency_med)
 
 
 def _history_values(state: Dict[str, Any], gauge_id: str, metric: str, limit: int = HISTORY_LIMIT) -> List[float]:
@@ -1029,6 +1072,16 @@ def tui_loop(args: argparse.Namespace) -> int:
                         if row_y < max_y - 2:
                             stdscr.addstr(row_y, 0, trend_line[:max_x - 1], palette.get("dim", 0))
                             row_y += 1
+
+                    # Latency stats.
+                    latency_med = g_state.get("latency_median_sec")
+                    latency_mad = g_state.get("latency_mad_sec")
+                    if isinstance(latency_med, (int, float)) and row_y < max_y - 2:
+                        lm = int(round(latency_med))
+                        ls = int(round(latency_mad)) if isinstance(latency_mad, (int, float)) else 0
+                        lat_line = f"Latency (obs→API): median {lm}s, MAD {ls}s"
+                        stdscr.addstr(row_y, 0, lat_line[:max_x - 1], palette.get("dim", 0))
+                        row_y += 1
 
                     # Forecast summary (if available).
                     forecast_all = state.get("forecast", {}).get(selected, {})

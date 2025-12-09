@@ -1,0 +1,59 @@
+# Global configuration for streamvis.
+#
+# This file is not yet wired into the runtime, but is designed to be
+# auto-populated (or hand-edited) with authoritative metadata for each
+# station, especially NOAA / NWPS forecast identifiers and endpoints.
+
+[global.usgs]
+# Primary observed-data source (ground truth).
+iv_base_url = "https://waterservices.usgs.gov/nwis/iv/"
+iv_api_base_url = "https://api.waterdata.usgs.gov/nwis/iv/"
+
+[global.noaa_nwps]
+# Base URL family for National Water Prediction Service APIs.
+# NOTE: The exact endpoint and version should be taken from current
+# NOAA documentation (e.g., https://water.noaa.gov/about/api).
+base_url = "https://water.noaa.gov/"
+
+# Optional default forecast template that may be refined per-station.
+# May contain {gauge_id}, {site_no}, and/or {nws_lid} placeholders.
+default_forecast_template = ""
+
+[stations.TANW1]
+gauge_id = "TANW1"
+display_name = "Middle Fork Snoqualmie River near Tanner"
+usgs_site_no = "12141300"
+
+# NOAA / NWPS identifiers and endpoints to be filled:
+nws_lid = ""                  # e.g., NWS location identifier, if applicable
+nwps_station_id = ""          # e.g., NWPS station ID, if distinct
+forecast_endpoint = ""        # fully-resolved forecast endpoint for this gauge
+fast_changes = false          # set true if this station is known to update faster than ~15 min
+
+[stations.GARW1]
+gauge_id = "GARW1"
+display_name = "SF Snoqualmie River above Alice Creek near Garcia"
+usgs_site_no = "12143400"
+nws_lid = ""
+nwps_station_id = ""
+forecast_endpoint = ""
+fast_changes = false
+
+[stations.SQUW1]
+gauge_id = "SQUW1"
+display_name = "Snoqualmie River near Snoqualmie"
+usgs_site_no = "12144500"
+nws_lid = ""
+nwps_station_id = ""
+forecast_endpoint = ""
+fast_changes = false
+
+[stations.CRNW1]
+gauge_id = "CRNW1"
+display_name = "Snoqualmie River near Carnation"
+usgs_site_no = "12149000"
+nws_lid = ""
+nwps_station_id = ""
+forecast_endpoint = ""
+fast_changes = false
+

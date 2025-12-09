@@ -65,3 +65,10 @@
 
 - Noticed that USGS sometimes updates stage and flow for a gauge at the same observation timestamp but at slightly different times, leading to a temporary mismatch where history showed a repeated flow value even after stage updated.
 - Updated `update_state_with_readings` so that when a new fetch has the same `observed_at` as the last stored point but different stage/flow, the last history entry for that timestamp is refreshed in place; cadence/latency learning still only advances on strictly newer timestamps.
+
+## 2025-12-10 – NW RFC textPlot cross-check (GARW1)
+
+- Introduced NW RFC textPlot integration via `NWRFC_TEXT_BASE` and a new `--nwrfc-text` flag that, when enabled, periodically fetches `textPlot.cgi?id=<lid>&pe=HG&bt=on` for supported stations (currently `GARW1`).
+- Implemented `parse_nwrfc_text` to parse observed/forecast stage and discharge from the text output, treating timestamps as PST/PDT and converting them to UTC.
+- Stored parsed series in `state["nwrfc"][gauge_id]` and computed a simple per-timestamp difference vs the latest USGS observation when timestamps align, recording Δstage/Δflow under `diff_vs_usgs`.
+- Extended the TUI expanded detail view to display a concise “NW RFC vs USGS (last)” line when cross-check data is available, so users can see whether the downstream NW RFC view closely matches raw USGS IV.

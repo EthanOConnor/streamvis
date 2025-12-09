@@ -112,6 +112,15 @@ Important:
   - Designed for low-latency access once products are issued.
   - Integrated here via the configurable `--forecast-base` URL template so operators can target the right low-latency endpoint for their stations.
 
+- **Cross-check data (optional)** – NW RFC text flowplots: `https://www.nwrfc.noaa.gov/station/flowplot/textPlot.cgi`
+  - Text hydrologic summaries (observed + forecast) for selected stations.
+  - When `--nwrfc-text` is enabled, `streamvis` periodically fetches the text plot for supported stations (currently `GARW1`) and:
+    - Parses observed stage/flow time series in local time (PST/PDT) and converts to UTC.
+    - Stores the series alongside USGS history in state.
+    - Computes a simple per-timestamp difference vs the latest USGS observation when timestamps align (Δstage, Δflow).
+  - In the TUI detail view, if NW RFC data is available for the selected station, a compact “NW RFC vs USGS (last)” line shows the latest deltas so you can see whether the downstream RFC view agrees with raw USGS IV.
+  - USGS IV remains the authoritative source; NW RFC is treated strictly as a secondary cross-check.
+
 Lightweight batching/caching:
 
 - All gauges are fetched in a single USGS call to avoid per-station chatter.

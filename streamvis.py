@@ -46,6 +46,17 @@ SITE_MAP = {
 
 USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
 
+# Optional NW RFC text-plot endpoint used for cross-checking observed
+# stage/flow for selected stations. We treat USGS IV as authoritative
+# and use NW RFC as a secondary view for comparison.
+NWRFC_TEXT_BASE = "https://www.nwrfc.noaa.gov/station/flowplot/textPlot.cgi"
+NWRFC_REFRESH_MIN = 15  # Minutes between NW RFC cross-checks when enabled.
+
+# For now we only wire GARW1; others can be added after verifying their IDs.
+NWRFC_ID_MAP: Dict[str, str] = {
+    "GARW1": "GARW1",
+}
+
 # Optional: rough flood thresholds for status coloring.
 # These are real for CRNW1 & SQUW1; TANW1 & GARW1 are placeholders you can tune.
 FLOOD_THRESHOLDS: Dict[str, Dict[str, float | None]] = {
@@ -116,6 +127,25 @@ def _fmt_rel(now: datetime, target: datetime | None) -> str:
         val = int(delta // 3600)
         unit = "h"
     return f"{suffix} {val}{unit}"
+
+
+def _parse_nwrfc_timestamp(date_str: str, time_str: str, tz_label: str | None) -> datetime | None:
+    """
+    Parse a NW RFC local timestamp (e.g., 2025-12-08 19:00) plus a timezone
+    label like PST or PDT into a UTC datetime.
+    """
+    try:
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+    # Treat PST/PDT as fixed offsets; this is sufficient for the local use here.
+    tz_label = (tz_label or "").upper()
+    if tz_label == "PDT":
+        offset = -7
+    else:
+        offset = -8
+    local = dt.replace(tzinfo=timezone(timedelta(hours=offset)))
+    return local.astimezone(timezone.utc)
 
 
 def classify_status(gauge_id: str, stage_ft: float | None) -> str:
@@ -618,6 +648,84 @@ def summarize_forecast_points(
     }
 
 
+def parse_nwrfc_text(text: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Parse NW RFC textPlot output into observed and forecast series.
+
+    We expect a header line with "Forecast/Trend Issued: <ts> <TZ>", a header
+    row with "Date/Time (PST) Stage Discharge", and then rows where the first
+    four columns are observed (date, time, stage, discharge) and optional
+    forecast columns follow.
+    """
+    if not text:
+        return {"observed": [], "forecast": []}
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    tz_label: str | None = None
+
+    for ln in lines:
+        if "Forecast/Trend Issued:" in ln:
+            parts = ln.split()
+            if parts:
+                tz_label = parts[-1]
+            break
+
+    observed: List[Dict[str, Any]] = []
+    forecast: List[Dict[str, Any]] = []
+
+    for ln in lines:
+        # Skip obvious headers.
+        if ln.startswith("SF ") or "Date/Time" in ln or ln.startswith("Observed"):
+            continue
+        parts = ln.split()
+        if len(parts) < 4:
+            continue
+        # Observed block.
+        o_date, o_time, o_stage_raw, o_flow_raw = parts[0], parts[1], parts[2], parts[3]
+        o_dt = _parse_nwrfc_timestamp(o_date, o_time, tz_label)
+        if o_dt is not None:
+            try:
+                o_stage = float(o_stage_raw)
+            except Exception:
+                o_stage = None
+            try:
+                o_flow = float(o_flow_raw)
+            except Exception:
+                o_flow = None
+            observed.append(
+                {
+                    "ts": o_dt.isoformat(),
+                    "stage": o_stage,
+                    "flow": o_flow,
+                }
+            )
+
+        # Forecast block may follow on the same line.
+        if len(parts) >= 8:
+            f_date, f_time, f_stage_raw, f_flow_raw = parts[4], parts[5], parts[6], parts[7]
+            f_dt = _parse_nwrfc_timestamp(f_date, f_time, tz_label)
+            if f_dt is not None:
+                try:
+                    f_stage = float(f_stage_raw)
+                except Exception:
+                    f_stage = None
+                try:
+                    f_flow = float(f_flow_raw)
+                except Exception:
+                    f_flow = None
+                forecast.append(
+                    {
+                        "ts": f_dt.isoformat(),
+                        "stage": f_stage,
+                        "flow": f_flow,
+                    }
+                )
+
+    observed.sort(key=lambda p: p["ts"])
+    forecast.sort(key=lambda p: p["ts"])
+    return {"observed": observed, "forecast": forecast}
+
+
 def update_forecast_state(
     state: Dict[str, Any],
     gauge_id: str,
@@ -742,6 +850,94 @@ def maybe_refresh_forecasts(state: Dict[str, Any], args: argparse.Namespace) -> 
             update_forecast_state(state, gauge_id, points, now=now, horizon_hours=args.forecast_hours)
 
     meta["last_forecast_fetch"] = now.isoformat()
+
+
+def update_nwrfc_state(
+    state: Dict[str, Any],
+    gauge_id: str,
+    series: Dict[str, List[Dict[str, Any]]],
+    now: datetime,
+) -> None:
+    """
+    Store NW RFC observed/forecast series for a gauge and compute simple
+    differences vs the latest USGS observation when timestamps align.
+    """
+    observed = series.get("observed") or []
+    forecast = series.get("forecast") or []
+    if not observed and not forecast:
+        return
+
+    nwrfc_state = state.setdefault("nwrfc", {})
+    g_nwrfc = nwrfc_state.setdefault(gauge_id, {})
+    g_nwrfc["observed"] = observed
+    g_nwrfc["forecast"] = forecast
+    g_nwrfc["last_fetch_at"] = now.isoformat()
+
+    # Cross-check against the latest USGS observation at the same timestamp.
+    gauges_state = state.get("gauges", {})
+    g_state = gauges_state.get(gauge_id, {})
+    last_ts_str = g_state.get("last_timestamp")
+    last_ts = _parse_timestamp(last_ts_str) if isinstance(last_ts_str, str) else None
+    if last_ts is None:
+        return
+
+    # Find NW RFC point with matching timestamp.
+    match = None
+    for p in reversed(observed):
+        ts_raw = p.get("ts")
+        dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+        if dt is not None and dt == last_ts:
+            match = p
+            break
+
+    if match is None:
+        return
+
+    usgs_stage = g_state.get("last_stage")
+    usgs_flow = g_state.get("last_flow")
+    nwrfc_stage = match.get("stage")
+    nwrfc_flow = match.get("flow")
+
+    diff: Dict[str, Any] = {"ts": last_ts.isoformat()}
+    if isinstance(usgs_stage, (int, float)) and isinstance(nwrfc_stage, (int, float)):
+        diff["stage_delta"] = usgs_stage - nwrfc_stage
+    if isinstance(usgs_flow, (int, float)) and isinstance(nwrfc_flow, (int, float)):
+        diff["flow_delta"] = usgs_flow - nwrfc_flow
+    if len(diff) > 1:
+        g_nwrfc["diff_vs_usgs"] = diff
+
+
+def maybe_refresh_nwrfc(state: Dict[str, Any], args: argparse.Namespace) -> None:
+    """
+    Optionally cross-check observed stage/flow against NW RFC textPlot
+    output for supported stations (currently GARW1).
+    """
+    enabled = getattr(args, "nwrfc_text", False)
+    if not enabled:
+        return
+
+    now = datetime.now(timezone.utc)
+    meta = state.setdefault("meta", {})
+    last_fetch_raw = meta.get("last_nwrfc_fetch")
+    last_fetch = _parse_timestamp(last_fetch_raw) if isinstance(last_fetch_raw, str) else None
+    if last_fetch is not None:
+        age_sec = (now - last_fetch).total_seconds()
+        if age_sec < NWRFC_REFRESH_MIN * 60:
+            return
+
+    for gauge_id, nwrfc_id in NWRFC_ID_MAP.items():
+        params = {"id": nwrfc_id, "pe": "HG", "bt": "on"}
+        try:
+            resp = requests.get(NWRFC_TEXT_BASE, params=params, timeout=10.0)
+            resp.raise_for_status()
+            text = resp.text
+        except Exception:
+            continue
+        series = parse_nwrfc_text(text)
+        if series.get("observed") or series.get("forecast"):
+            update_nwrfc_state(state, gauge_id, series, now=now)
+
+    meta["last_nwrfc_fetch"] = now.isoformat()
 
 
 def update_state_with_readings(
@@ -1307,6 +1503,18 @@ def tui_loop(args: argparse.Namespace) -> int:
                         stdscr.addstr(row_y, 0, lat_line[:max_x - 1], palette.get("dim", 0))
                         row_y += 1
 
+                    # NW RFC cross-check (if available).
+                    nwrfc_all = state.get("nwrfc", {}).get(selected, {})
+                    diff = nwrfc_all.get("diff_vs_usgs") if isinstance(nwrfc_all, dict) else None
+                    if diff and row_y < max_y - 2:
+                        sd = diff.get("stage_delta")
+                        qd = diff.get("flow_delta")
+                        sd_str = f"{sd:+.2f} ft" if isinstance(sd, (int, float)) else "n/a"
+                        qd_str = f"{qd:+.0f} cfs" if isinstance(qd, (int, float)) else "n/a"
+                        line = f"NW RFC vs USGS (last): Δstage {sd_str}, Δflow {qd_str}"
+                        stdscr.addstr(row_y, 0, line[:max_x - 1], palette.get("dim", 0))
+                        row_y += 1
+
                     # Forecast summary (if available).
                     forecast_all = state.get("forecast", {}).get(selected, {})
                     summary = forecast_all.get("summary") if isinstance(forecast_all, dict) else None
@@ -1422,6 +1630,7 @@ def tui_loop(args: argparse.Namespace) -> int:
                     retry_wait = args.min_retry_seconds
                     update_state_with_readings(state, readings, poll_ts=now)
                     maybe_refresh_forecasts(state, args)
+                    maybe_refresh_nwrfc(state, args)
                     save_state(state_path, state)
                     next_poll_at = schedule_next_poll(
                         state,
@@ -1572,6 +1781,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default="stage",
         help="Metric to chart in TUI mode.",
     )
+    parser.add_argument(
+        "--nwrfc-text",
+        action="store_true",
+        help=(
+            "Enable NW RFC textPlot cross-check for supported gauges "
+            "(currently GARW1) to compare observed stage/flow against USGS."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1596,6 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
 
     update_state_with_readings(state, data, poll_ts=datetime.now(timezone.utc))
     maybe_refresh_forecasts(state, args)
+    maybe_refresh_nwrfc(state, args)
     save_state(state_path, state)
     render_table(data, state)
 

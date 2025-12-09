@@ -24,6 +24,7 @@ EWMA_ALPHA = 0.30               # How quickly to learn update cadence.
 HISTORY_LIMIT = 120            # Keep a small rolling window of observations.
 UI_TICK_SEC = 0.15             # UI refresh tick for TUI mode.
 MIN_UPDATE_GAP_SEC = 8 * 60     # Ignore sub-8-minute deltas when learning cadence.
+FORECAST_REFRESH_MIN = 60       # Do not refetch forecasts more often than this.
 MAX_LEARNABLE_INTERVAL_SEC = 6 * 3600  # Do not learn cadences longer than 6 hours.
 
 # USGS gauge IDs for the Snoqualmie system we care about.
@@ -449,6 +450,257 @@ def maybe_backfill_state(state: Dict[str, Any], hours_back: int) -> None:
     meta["backfill_hours"] = max(int(previous or 0), int(hours_back))
 
 
+def _resolve_forecast_url(template: str, gauge_id: str, site_no: str) -> str:
+    """
+    Format a forecast URL from a template.
+
+    The template may contain `{gauge_id}` and `{site_no}` placeholders, for example:
+        https://example/api/stations/{gauge_id}/forecast
+    """
+    return template.format(gauge_id=gauge_id, site_no=site_no)
+
+
+def fetch_forecast_series(
+    forecast_base: str,
+    gauge_id: str,
+    site_no: str,
+    horizon_hours: int,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch forecast time series for a single gauge.
+
+    This function deliberately treats the response as shape-agnostic and only
+    assumes we can extract a sequence of (timestamp, stage, flow)-like points.
+
+    Operators should point `forecast_base` at an appropriate NOAA / NWPS endpoint
+    and adjust the parsing logic here to match the actual payload.
+    """
+    if not forecast_base:
+        return []
+
+    url = _resolve_forecast_url(forecast_base, gauge_id=gauge_id, site_no=site_no)
+    params: Dict[str, Any] = {}
+    if horizon_hours > 0:
+        # Many forecast APIs accept a horizon or end-time parameter; adapt as needed.
+        params["horizon_hours"] = horizon_hours
+
+    try:
+        resp = requests.get(url, params=params or None, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+
+    # Accept either a list of points or an object with a top-level list.
+    if isinstance(data, list):
+        series = data
+    elif isinstance(data, dict):
+        # Heuristic: look for a likely list field.
+        for key in ("forecast", "values", "data", "series"):
+            val = data.get(key)
+            if isinstance(val, list):
+                series = val
+                break
+        else:
+            return []
+    else:
+        return []
+
+    points: List[Dict[str, Any]] = []
+    for entry in series:
+        if not isinstance(entry, dict):
+            continue
+
+        # NOTE: The field names below are *assumptions* and may need to be
+        # adjusted to match the actual NWPS API. Common patterns include
+        # `validTime`, `time`, or `forecast_time` for timestamps, and
+        # stage/flow values in feet / cfs.
+        ts_raw = entry.get("validTime") or entry.get("time") or entry.get("ts")
+        dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+        if dt is None:
+            continue
+
+        stage = entry.get("stage_ft") or entry.get("stage") or entry.get("value")
+        flow = entry.get("flow_cfs") or entry.get("flow")
+
+        point = {
+            "ts": dt.isoformat(),
+            "stage": float(stage) if isinstance(stage, (int, float)) else None,
+            "flow": float(flow) if isinstance(flow, (int, float)) else None,
+        }
+        points.append(point)
+
+    # Ensure points are sorted by time.
+    points.sort(key=lambda p: p["ts"])
+    return points
+
+
+def summarize_forecast_points(
+    points: List[Dict[str, Any]],
+    now: datetime,
+    horizon_hours: int,
+) -> Dict[str, Any]:
+    """
+    Compute 3-hour, 24-hour, and full-horizon maxima for stage and flow.
+    """
+    if not points:
+        return {}
+
+    max_3h = {"stage": None, "flow": None, "ts": None}
+    max_24h = {"stage": None, "flow": None, "ts": None}
+    max_full = {"stage": None, "flow": None, "ts": None}
+
+    horizon_sec = horizon_hours * 3600 if horizon_hours > 0 else None
+
+    for p in points:
+        ts_raw = p.get("ts")
+        dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+        if dt is None:
+            continue
+        delta = (dt - now).total_seconds()
+        if delta < 0:
+            # Only look forward for maxima.
+            continue
+        if horizon_sec is not None and delta > horizon_sec:
+            continue
+
+        stage = p.get("stage")
+        flow = p.get("flow")
+
+        def bump(target: Dict[str, Any]) -> None:
+            if isinstance(stage, (int, float)):
+                if target["stage"] is None or stage > target["stage"]:
+                    target["stage"] = stage
+                    target["ts"] = dt.isoformat()
+            if isinstance(flow, (int, float)):
+                if target["flow"] is None or flow > target["flow"]:
+                    target["flow"] = flow
+                    target["ts"] = dt.isoformat()
+
+        if delta <= 3 * 3600:
+            bump(max_3h)
+        if delta <= 24 * 3600:
+            bump(max_24h)
+        bump(max_full)
+
+    return {
+        "max_3h": max_3h,
+        "max_24h": max_24h,
+        "max_full": max_full,
+    }
+
+
+def update_forecast_state(
+    state: Dict[str, Any],
+    gauge_id: str,
+    points: List[Dict[str, Any]],
+    now: datetime,
+    horizon_hours: int,
+) -> None:
+    """
+    Store forecast points and summary for a gauge, and compute basic bias stats
+    using observed history when available.
+    """
+    if not points:
+        return
+
+    forecast_state = state.setdefault("forecast", {})
+    g_forecast = forecast_state.setdefault(gauge_id, {})
+
+    # De-duplicate by timestamp.
+    by_ts: Dict[str, Dict[str, Any]] = {}
+    for p in points:
+        ts = p.get("ts")
+        if isinstance(ts, str):
+            by_ts[ts] = p
+    ordered_ts = sorted(by_ts.keys())
+    g_forecast["points"] = [by_ts[ts] for ts in ordered_ts]
+
+    summary = summarize_forecast_points(g_forecast["points"], now=now, horizon_hours=horizon_hours)
+    g_forecast["summary"] = summary
+
+    # Amplitude bias: compare last observed vs nearest forecast.
+    gauges_state = state.get("gauges", {})
+    g_state = gauges_state.get(gauge_id, {})
+    last_ts_str = g_state.get("last_timestamp")
+    last_ts = _parse_timestamp(last_ts_str) if isinstance(last_ts_str, str) else None
+    last_stage = g_state.get("last_stage")
+    last_flow = g_state.get("last_flow")
+
+    if last_ts is not None:
+        nearest = None
+        best_dt = None
+        for p in g_forecast["points"]:
+            ts_raw = p.get("ts")
+            dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+            if dt is None:
+                continue
+            diff = abs((dt - last_ts).total_seconds())
+            if best_dt is None or diff < best_dt:
+                best_dt = diff
+                nearest = p
+
+        if nearest is not None:
+            f_stage = nearest.get("stage")
+            f_flow = nearest.get("flow")
+            bias: Dict[str, Any] = {}
+            if isinstance(last_stage, (int, float)) and isinstance(f_stage, (int, float)):
+                bias["stage_delta"] = last_stage - f_stage
+                bias["stage_ratio"] = (last_stage / f_stage) if f_stage not in (0, None) else None
+            if isinstance(last_flow, (int, float)) and isinstance(f_flow, (int, float)):
+                bias["flow_delta"] = last_flow - f_flow
+                bias["flow_ratio"] = (last_flow / f_flow) if f_flow not in (0, None) else None
+            if bias:
+                g_forecast["bias"] = bias
+
+    # Phase: compare forecast peak time vs observed recent peak time.
+    history = (g_state.get("history") or [])[-HISTORY_LIMIT:]
+    if history and summary.get("max_full", {}).get("ts"):
+        forecast_peak_ts = _parse_timestamp(summary["max_full"]["ts"])
+        if forecast_peak_ts is not None:
+            # Observed peak over the same window.
+            peak_obs_dt = None
+            peak_obs_stage = None
+            for entry in history:
+                ts_raw = entry.get("ts")
+                dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+                s = entry.get("stage")
+                if dt is None or not isinstance(s, (int, float)):
+                    continue
+                if peak_obs_stage is None or s > peak_obs_stage:
+                    peak_obs_stage = s
+                    peak_obs_dt = dt
+
+            if peak_obs_dt is not None:
+                shift_sec = (peak_obs_dt - forecast_peak_ts).total_seconds()
+                g_forecast["phase_shift_sec"] = shift_sec
+
+
+def maybe_refresh_forecasts(state: Dict[str, Any], args: argparse.Namespace) -> None:
+    """
+    Refresh forecasts for all gauges at most once per FORECAST_REFRESH_MIN minutes.
+    """
+    base = getattr(args, "forecast_base", "") or ""
+    if not base:
+        return
+
+    now = datetime.now(timezone.utc)
+    meta = state.setdefault("meta", {})
+    last_fetch_raw = meta.get("last_forecast_fetch")
+    last_fetch = _parse_timestamp(last_fetch_raw) if isinstance(last_fetch_raw, str) else None
+    if last_fetch is not None:
+        age_sec = (now - last_fetch).total_seconds()
+        if age_sec < FORECAST_REFRESH_MIN * 60:
+            return
+
+    for gauge_id, site_no in SITE_MAP.items():
+        points = fetch_forecast_series(base, gauge_id, site_no, args.forecast_hours)
+        if points:
+            update_forecast_state(state, gauge_id, points, now=now, horizon_hours=args.forecast_hours)
+
+    meta["last_forecast_fetch"] = now.isoformat()
+
+
 def update_state_with_readings(state: Dict[str, Any], readings: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
     """
     Update persisted state with latest observations and learn per-gauge cadence.
@@ -776,6 +1028,47 @@ def tui_loop(args: argparse.Namespace) -> int:
                         trend_line = f"Trend: stage {stage_trend:+.2f} ft/h   flow {flow_trend:+.0f} cfs/h"
                         if row_y < max_y - 2:
                             stdscr.addstr(row_y, 0, trend_line[:max_x - 1], palette.get("dim", 0))
+                            row_y += 1
+
+                    # Forecast summary (if available).
+                    forecast_all = state.get("forecast", {}).get(selected, {})
+                    summary = forecast_all.get("summary") if isinstance(forecast_all, dict) else None
+                    bias = forecast_all.get("bias") if isinstance(forecast_all, dict) else None
+                    phase_shift_sec = forecast_all.get("phase_shift_sec") if isinstance(forecast_all, dict) else None
+                    if summary and row_y < max_y - 2:
+                        def fmt_peak(key: str) -> str:
+                            block = summary.get(key) or {}
+                            s = block.get("stage")
+                            q = block.get("flow")
+                            s_str = f"{s:.2f} ft" if isinstance(s, (int, float)) else "--"
+                            q_str = f"{int(q)} cfs" if isinstance(q, (int, float)) else "--"
+                            return f"{s_str} / {q_str}"
+
+                        line1 = (
+                            f"Forecast peaks (stage/flow): "
+                            f"3h {fmt_peak('max_3h')}  |  24h {fmt_peak('max_24h')}  |  full {fmt_peak('max_full')}"
+                        )
+                        stdscr.addstr(row_y, 0, line1[:max_x - 1], palette.get("dim", 0))
+                        row_y += 1
+
+                        if bias and row_y < max_y - 1:
+                            sd = bias.get("stage_delta")
+                            sr = bias.get("stage_ratio")
+                            qd = bias.get("flow_delta")
+                            qr = bias.get("flow_ratio")
+                            sd_str = f"{sd:+.2f} ft" if isinstance(sd, (int, float)) else "n/a"
+                            sr_str = f"{sr:.2f}×" if isinstance(sr, (int, float)) else "n/a"
+                            qd_str = f"{qd:+.0f} cfs" if isinstance(qd, (int, float)) else "n/a"
+                            qr_str = f"{qr:.2f}×" if isinstance(qr, (int, float)) else "n/a"
+                            line2 = f"Vs forecast now: Δstage {sd_str} ({sr_str}), Δflow {qd_str} ({qr_str})"
+                            stdscr.addstr(row_y, 0, line2[:max_x - 1], palette.get("dim", 0))
+                            row_y += 1
+
+                        if isinstance(phase_shift_sec, (int, float)) and row_y < max_y - 1:
+                            hours = phase_shift_sec / 3600.0
+                            sign = "earlier" if hours < 0 else "later"
+                            line3 = f"Peak timing: {abs(hours):.2f} h {sign} than forecast"
+                            stdscr.addstr(row_y, 0, line3[:max_x - 1], palette.get("dim", 0))
             else:
                 # Compact detail: sparkline chart and summary stats.
                 chart_vals = _history_values(state, selected, chart_metric)
@@ -846,6 +1139,7 @@ def tui_loop(args: argparse.Namespace) -> int:
                     readings = fetched
                     retry_wait = args.min_retry_seconds
                     update_state_with_readings(state, readings)
+                    maybe_refresh_forecasts(state, args)
                     save_state(state_path, state)
                     next_poll_at = predict_next_poll(state, now)
                     if next_poll_at <= now:
@@ -912,6 +1206,7 @@ def adaptive_loop(args: argparse.Namespace) -> int:
 
         retry_wait = args.min_retry_seconds
         updates = update_state_with_readings(state, readings)
+        maybe_refresh_forecasts(state, args)
         save_state(state_path, state)
 
         if next_poll_at is None or any(updates.values()):
@@ -960,6 +1255,21 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Maximum retry delay when backing off.",
     )
     parser.add_argument(
+        "--forecast-base",
+        default="",
+        help=(
+            "URL template for NOAA/NWPS forecast API. "
+            "May contain {gauge_id} and {site_no} placeholders; "
+            "if empty, forecast integration is disabled."
+        ),
+    )
+    parser.add_argument(
+        "--forecast-hours",
+        type=int,
+        default=72,
+        help="Forecast horizon (hours) to consider when summarizing peaks if forecast is enabled.",
+    )
+    parser.add_argument(
         "--backfill-hours",
         type=int,
         default=0,
@@ -994,6 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     update_state_with_readings(state, data)
+    maybe_refresh_forecasts(state, args)
     save_state(state_path, state)
     render_table(data, state)
 

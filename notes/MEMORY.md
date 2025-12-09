@@ -15,3 +15,13 @@
 - Design constraint:
   - Polling must be “polite first”: default cadence mimics the data’s natural interval (starting at 8 minutes), and the system should never fall into a 1/minute polling regime except on deliberate manual refresh.
 
+## 2025-12-09 – Forecast integration model
+
+- Forecasts are treated as an optional overlay sourced from NOAA’s National Water Prediction Service (NWPS) via an operator-configurable `--forecast-base` URL template.
+- The code assumes a generic “time, stage, flow” forecast series and:
+  - Stores forecast points per gauge in state.
+  - Computes forward-looking maxima for 3h, 24h, and the full configured horizon (`--forecast-hours`).
+  - Compares the latest observation to the nearest forecast point to estimate amplitude bias (delta + ratio) for stage and flow.
+  - Compares observed vs forecast peak times to estimate a simple phase shift (peak earlier/later than forecast).
+- In TUI detail mode, forecast summaries are displayed only when forecast data is present, keeping the core UX clean when forecasts are disabled.
+- We intentionally do not lock in a specific NWPS endpoint or JSON shape; operators are expected to align the URL template and parsing with NOAA’s current documentation while keeping our cadence and caching design intact.

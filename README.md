@@ -52,13 +52,56 @@ Behavior:
 - Schedules the next multi-gauge request just before the next expected update (shared single call for all gauges).
 - If the prediction was early (no new timestamps), it widens the interval slightly and does a short retry (default 60s) so it converges toward ~1 call per new update.
 - Persisted state lives at `~/.streamvis_state.json` (override with `--state-file PATH`). Only the last timestamps, learned intervals, and last values are stored—no heavy history.
-- Learning has sensible floors/ceilings: sub-minute deltas are ignored to avoid over-polling; learned intervals are clamped to a reasonable range before scheduling the next fetch.
+- Learning has sensible floors/ceilings: sub-8-minute deltas are ignored when learning cadence, and learned intervals are clamped to a reasonable range before scheduling the next fetch.
 
 Options:
 
 - `--min-retry-seconds` (default 60): retry delay if the prediction was early.
 - `--max-retry-seconds` (default 300): ceiling when backing off on errors.
 - `--backfill-hours` (default 0): on startup, optionally backfill this many hours of recent history from USGS IV to seed the cadence learner and charts.
+
+## Forecast integration (optional, via NWPS)
+
+`streamvis` can optionally overlay official river forecasts from NOAA’s National Water Prediction Service (NWPS) when configured with an appropriate API endpoint.
+
+CLI options:
+
+- `--forecast-base`: URL template for the forecast API. It may contain `{gauge_id}` and `{site_no}` placeholders from `SITE_MAP`.  
+  - Example template (you must align this with NOAA’s current API docs before use):
+    - `--forecast-base 'https://api.water.noaa.gov/.../stations/{gauge_id}/forecast'`
+- `--forecast-hours` (default 72): forecast horizon (in hours) considered when computing peak summaries.
+
+Behavior when enabled:
+
+- Forecasts are refreshed for all gauges at most once per 60 minutes (`FORECAST_REFRESH_MIN`).
+- For each station, `streamvis`:
+  - Stores a forecast time series (time, stage, flow) in local state.
+  - Computes 3-hour, 24-hour, and full-horizon maxima for stage and flow.
+  - Compares the latest observation to the nearest forecast point to estimate amplitude bias (delta and ratio).
+  - Compares observed vs forecast peak times to estimate a simple phase shift (peak earlier/later than forecast).
+- In the TUI detail view (select station + `Enter`):
+  - Shows a table of the last few updates and trends.
+  - If forecast data is available:
+    - Displays forecast peak summaries: 3h / 24h / full (stage/flow).
+    - Shows “vs forecast now” deltas and ratios for stage and flow.
+    - Shows an estimated peak timing offset (hours earlier/later than forecast).
+
+Important:
+
+- This repository is developed offline, so the exact NOAA/NWPS endpoint and JSON shape are **not** hard-coded as authoritative.
+- The forecast parsing logic in `streamvis.py` is intentionally conservative and documented as making shape assumptions; you should adapt the URL template and field mapping to match NOAA’s current NWPS API documentation for your gauges.
+
+## APIs and sources of truth
+
+- **Observed data** – USGS NWIS Instantaneous Values (IV): `https://waterservices.usgs.gov/nwis/iv/`
+  - Official USGS hydrologic observations (stage and flow).
+  - Near-real-time, typically 15-minute resolution.
+  - Supports multi-station, multi-parameter JSON responses in a single call; ideal for polite, batched polling.
+
+- **Forecast data** – NOAA National Water Prediction Service (NWPS): `water.noaa.gov` APIs.
+  - Official river stage/flow forecasts produced by River Forecast Centers.
+  - Designed for low-latency access once products are issued.
+  - Integrated here via the configurable `--forecast-base` URL template so operators can target the right low-latency endpoint for their stations.
 
 Lightweight batching/caching:
 

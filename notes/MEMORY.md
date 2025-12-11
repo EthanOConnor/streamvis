@@ -110,3 +110,14 @@
 
 - **Forecast numeric coercion**:
   - Decision: accept numeric strings in forecast payloads by coercing to float; treat non-numeric strings as missing.
+
+## 2025-12-11 – Browser rendering and mobile defaults
+
+- **Web color rendering**:
+  - Decision: implement a minimal, dependency-free curses color model in `web_curses` by tracking per-cell attributes and emitting HTML spans with inline styles on refresh.
+  - Color pairs are encoded into high bits (pair << 8) so attribute OR-ing (`A_BOLD`, `A_REVERSE`, `A_UNDERLINE`) remains stable.
+  - Trade‑off: span-based redraw is slightly heavier than plain text but remains fast given ≤60×200 cells and avoids pulling in a JS terminal library.
+
+- **Mobile/iOS performance knob**:
+  - Decision: add `--ui-tick-sec` (default 0.15) to let slow devices reduce UI frequency without affecting polling cadence.
+  - Browser entrypoint uses `--ui-tick-sec 0.25` by default to keep Pyodide/Safari responsive.

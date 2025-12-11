@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import html
 import time
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 try:
     from js import document, window  # type: ignore[import]
@@ -29,7 +30,17 @@ KEY_DOWN = 258
 KEY_ENTER = 343
 
 
-_color_pairs: dict[int, int] = {0: 0}
+# Color pair mapping: pair_number -> {"fg": curses color const, "bg": curses color const}
+_color_pairs: Dict[int, Dict[str, int]] = {0: {"fg": COLOR_GREEN, "bg": -1}}
+
+
+def _encode_pair(pair_number: int) -> int:
+    # Shift into high bits so OR-ing with attribute flags is safe.
+    return int(pair_number) << 8
+
+
+def _decode_pair(attr: int) -> int:
+    return (int(attr) >> 8) & 0xFF
 
 
 def has_colors() -> bool:
@@ -45,11 +56,13 @@ def use_default_colors() -> None:
 
 
 def init_pair(pair_number: int, fg: int, bg: int) -> None:
-    _color_pairs[pair_number] = pair_number
+    _color_pairs[int(pair_number)] = {"fg": int(fg), "bg": int(bg)}
 
 
 def color_pair(pair_number: int) -> int:
-    return _color_pairs.get(pair_number, 0)
+    if int(pair_number) not in _color_pairs:
+        _color_pairs[int(pair_number)] = {"fg": COLOR_GREEN, "bg": -1}
+    return _encode_pair(int(pair_number))
 
 
 def curs_set(visibility: int) -> None:
@@ -111,6 +124,7 @@ class _Window:
     rows: int
     cols: int
     _buffer: List[List[str]]
+    _attr_buffer: List[List[int]]
     _nodelay: bool = False
     _timeout_ms: int = -1
 
@@ -128,18 +142,23 @@ class _Window:
         if rows > self.rows:
             for _ in range(rows - self.rows):
                 self._buffer.append([" " for _ in range(self.cols)])
+                self._attr_buffer.append([0 for _ in range(self.cols)])
         elif rows < self.rows:
             self._buffer = self._buffer[:rows]
+            self._attr_buffer = self._attr_buffer[:rows]
         self.rows = rows
 
         # Resize columns.
         if cols != self.cols:
             for r in range(self.rows):
                 row = self._buffer[r]
+                arow = self._attr_buffer[r]
                 if cols > self.cols:
                     row.extend([" "] * (cols - self.cols))
+                    arow.extend([0] * (cols - self.cols))
                 elif cols < self.cols:
                     self._buffer[r] = row[:cols]
+                    self._attr_buffer[r] = arow[:cols]
             self.cols = cols
 
     def getmaxyx(self) -> Tuple[int, int]:
@@ -151,6 +170,7 @@ class _Window:
         for r in range(self.rows):
             for c in range(self.cols):
                 self._buffer[r][c] = " "
+                self._attr_buffer[r][c] = 0
 
     def addstr(self, y: int, x: int, s: str, attr: int = 0) -> None:
         if y < 0 or y >= self.rows:
@@ -164,10 +184,58 @@ class _Window:
             c = x + i
             if 0 <= c < self.cols:
                 self._buffer[y][c] = ch
+                self._attr_buffer[y][c] = int(attr)
 
     def refresh(self) -> None:
-        lines = ["".join(row).rstrip() for row in self._buffer]
-        self._term_el.textContent = "\n".join(lines)
+        def css_for_attr(attr: int) -> str:
+            pair = _decode_pair(attr)
+            pair_info = _color_pairs.get(pair, _color_pairs[0])
+            fg_const = pair_info.get("fg", COLOR_GREEN)
+            reverse = bool(attr & A_REVERSE)
+            bold = bool(attr & A_BOLD)
+            underline = bool(attr & A_UNDERLINE)
+
+            color_map = {
+                COLOR_GREEN: "#0f0",
+                COLOR_YELLOW: "#ff0",
+                COLOR_RED: "#f44",
+                COLOR_CYAN: "#0ff",
+            }
+            fg = color_map.get(fg_const, "#0f0")
+            bg = "#000"
+            if reverse:
+                fg, bg = "#000", fg
+            styles = [f"color: {fg}", f"background-color: {bg}"]
+            if bold:
+                styles.append("font-weight: bold")
+            if underline:
+                styles.append("text-decoration: underline")
+            return "; ".join(styles)
+
+        html_lines: List[str] = []
+        for row_chars, row_attrs in zip(self._buffer, self._attr_buffer):
+            out_parts: List[str] = []
+            current_attr = None
+            segment: List[str] = []
+            for ch, attr in zip(row_chars, row_attrs):
+                if current_attr is None:
+                    current_attr = attr
+                if attr != current_attr:
+                    text = html.escape("".join(segment))
+                    style = css_for_attr(int(current_attr))
+                    out_parts.append(f'<span style="{style}">{text}</span>')
+                    segment = []
+                    current_attr = attr
+                segment.append(ch)
+
+            if segment:
+                text = html.escape("".join(segment))
+                style = css_for_attr(int(current_attr or 0))
+                out_parts.append(f'<span style="{style}">{text}</span>')
+
+            html_lines.append("".join(out_parts).rstrip())
+
+        self._term_el.innerHTML = "\n".join(html_lines)
 
     def nodelay(self, flag: bool) -> None:
         self._nodelay = flag
@@ -208,7 +276,8 @@ def initscr() -> _Window:
     # Fixed canvas; sized generously for the existing TUI layout.
     rows, cols = 40, 120
     buf = [[" " for _ in range(cols)] for _ in range(rows)]
-    return _Window(rows=rows, cols=cols, _buffer=buf)
+    abuf = [[0 for _ in range(cols)] for _ in range(rows)]
+    return _Window(rows=rows, cols=cols, _buffer=buf, _attr_buffer=abuf)
 
 
 def wrapper(func: Any) -> int:

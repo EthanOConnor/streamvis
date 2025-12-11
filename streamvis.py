@@ -1856,7 +1856,10 @@ def tui_loop(args: argparse.Namespace) -> int:
         # In TUI mode we want near-zero CPU usage when idle, so we rely on
         # a small blocking timeout for getch() instead of a busy loop.
         stdscr.nodelay(False)
-        stdscr.timeout(int(UI_TICK_SEC * 1000))
+        ui_tick = getattr(args, "ui_tick_sec", UI_TICK_SEC)
+        if not isinstance(ui_tick, (int, float)) or ui_tick <= 0:
+            ui_tick = UI_TICK_SEC
+        stdscr.timeout(int(ui_tick * 1000))
         palette: Dict[str, int] = {"normal": 0, "title": 0, "dim": 0, "chart": 0}
 
         if curses.has_colors():
@@ -2089,6 +2092,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=["stage", "flow"],
         default="stage",
         help="Metric to chart in TUI mode.",
+    )
+    parser.add_argument(
+        "--ui-tick-sec",
+        type=float,
+        default=UI_TICK_SEC,
+        help="UI refresh tick in TUI mode (seconds).",
     )
     parser.add_argument(
         "--nwrfc-text",

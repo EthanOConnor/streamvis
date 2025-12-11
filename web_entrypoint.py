@@ -26,6 +26,8 @@ def run_default() -> int:
         "streamvis_state.json",
         "--backfill-hours",
         "12",
+        "--ui-tick-sec",
+        "0.25",
     ]
     return main(argv)
 

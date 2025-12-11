@@ -112,3 +112,9 @@
 - Added `EDGW1` to built-in defaults so primary gauge ordering is consistent out of the box.
 - Implemented a best-effort single-writer lock for state files using `fcntl` and documented it in README.
 - Preserved last non-None stage/flow on partial USGS reads and added numeric-string coercion for forecast parsing.
+
+## 2025-12-11 – Browser colors and iOS usability
+
+- Implemented per-cell color/attribute rendering in the Pyodide `web_curses` shim using span-based HTML output.
+- Added `--ui-tick-sec` CLI flag and set a slower default tick for the browser entrypoint to reduce CPU on mobile/iOS.
+- Tweaked web CSS for responsive font sizing, safe-area padding, and touch-friendly interaction.

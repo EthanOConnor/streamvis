@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, List, Tuple
 
 try:
@@ -179,13 +180,28 @@ class _Window:
             queue = window.streamvisKeyQueue  # type: ignore[attr-defined]
         except Exception:
             return -1
-        if not queue:
+        if queue:
+            key = queue.pop(0)
+            try:
+                return int(key)
+            except Exception:
+                return -1
+
+        # Respect basic curses timing semantics to avoid a busy loop:
+        # - If nodelay is True or timeout == 0, return immediately.
+        # - If timeout < 0, behave like "blocking" but we can't truly block
+        #   in a browser; instead sleep briefly to yield CPU.
+        # - If timeout > 0, sleep up to that many milliseconds.
+        if self._nodelay or self._timeout_ms == 0:
             return -1
-        key = queue.pop(0)
-        try:
-            return int(key)
-        except Exception:
+
+        timeout_ms = self._timeout_ms
+        if timeout_ms is None or timeout_ms < 0:
+            time.sleep(0.05)
             return -1
+
+        time.sleep(timeout_ms / 1000.0)
+        return -1
 
 
 def initscr() -> _Window:

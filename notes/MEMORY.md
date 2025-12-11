@@ -72,3 +72,15 @@
 - Each poll (whether or not a new observation appears) now records `last_poll_ts` per gauge; when a new point arrives, latency windows use the last “no-update” poll as the lower bound and the current poll as the upper bound for the observation→API delay.
 - A per-gauge `no_update_polls` counter is persisted so runs can see how many consecutive polls have seen no change; this is currently logging/diagnostic data but can inform future cadence heuristics.
 - Cadence learning continues to rely on all observed update deltas via EWMA and, when backfill is enabled, on the full `HISTORY_LIMIT` window of recent history; older points naturally down-weight via the EWMA rather than explicit re-computation on every startup. When at least three deltas have been observed and the learned mean is still significantly shorter than the empirical average, we snap the mean upward toward that average to avoid underestimating slow gauges (e.g., hourly stations) for too long.
+
+## 2025-12-11 – Packaging and browser-loop decisions
+
+- **Packaging source of truth**:
+  - Although `streamvis` remains conceptually a single‑file core, it now depends on a few small peer modules (`http_client.py`, optional web shims).
+  - Decision: keep the flat, multi‑module layout and include those modules explicitly in `pyproject.toml` `py-modules` so the installed console script works without refactoring into a package.
+  - Trade‑off: minimal disruption and preserves “single‑file core” ergonomics; a package refactor remains available if module count grows materially.
+
+- **Browser TUI throttling**:
+  - The native TUI relies on `curses.timeout()` to avoid busy‑looping between UI ticks.
+  - Decision: implement synchronous timeout semantics in `web_curses.getch()` (sleeping for the configured timeout) as a short‑term, dependency‑free fix to prevent pegged CPU in Pyodide.
+  - Trade‑off: input is only serviced between ticks (≤ UI_TICK_SEC), which is acceptable for interactive use; longer‑term async `web_tui_main()` remains on `notes/BACKLOG.md` for a fully cooperative browser loop.

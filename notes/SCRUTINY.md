@@ -250,3 +250,50 @@ Design vs implementation:
 - **Medium – Config drift risk**: USGS URLs, `SITE_MAP`, and thresholds live in code while `config.toml` mirrors them. Until config loading exists, document the “code is authoritative” stance; afterwards, centralize the single source to avoid silent divergence.
 - **Low – State write robustness/locking**: concurrent runs or crashes mid-write can corrupt `~/.streamvis_state.json` (writes were non-atomic). Resolution: state writes now go via a temporary file + atomic rename; locking for multi-writer scenarios remains future work.
 - **Validation plan**: add synthetic schedule tests (fast vs slow cadence; high vs low latency MAD; mixed gauges to observe shared-call bias) and a metric that logs “calls per station per real update” to verify the politeness envelope and fine-window duty cycle. Tracked in `notes/BACKLOG.md`.
+
+## 2025-12-11 – Comprehensive repo review and P0 remediation
+
+**High-level**
+
+- The repo is compact and well‑reasoned: core logic lives in `streamvis.py`, with tiny shims for HTTP (`http_client.py`) and browser TUI compatibility (`web_curses.py`, `web_entrypoint.py`). Notes system is strong and keeps intent vs reality clear.
+- Adaptive cadence + latency‑window scheduling is the main intellectual asset; TUI and optional forecast/NW RFC overlays are integrated without heavy dependencies.
+
+**Strengths**
+
+- Soft‑fail network/API handling across all fetchers; callers degrade gracefully without busy‑looping (`fetch_gauge_data`, `fetch_gauge_history`, `fetch_forecast_series`, `maybe_refresh_nwrfc`).
+- State integrity is robust: de‑dup by timestamp, clamp cadence, cap history, atomic writes (`_cleanup_state`, `save_state`).
+- Scheduler design is thoughtful: EWMA cadence learning + latency median/MAD + coarse→fine regimes (`update_state_with_readings`, `predict_gauge_next`, `schedule_next_poll`).
+- TUI UX is clear and efficient: fast tick, bounded rendering, detail panes only when requested, forecast/NW RFC shown only when available.
+- Dependency footprint stays minimal (requests only; TOML parsing done in‑house for the small subset needed).
+
+**P0 – Must‑fix issues**
+
+1. **Packaging broke installed CLI** (now resolved).
+   - Symptom: `pip install .` produced a console script that imported `streamvis`, but `streamvis` imports `http_client`; setuptools only packaged `streamvis.py`, so installed runs failed with `ModuleNotFoundError: http_client`.
+   - Fix: include `http_client`, `web_curses`, and `web_entrypoint` in `pyproject.toml` `py-modules` so installed CLI and optional browser entrypoint work out of the box.
+   - Resolution: patched on 2025‑12‑11.
+
+2. **Browser TUI busy‑loop / UI starvation risk** (now mitigated).
+   - Symptom: `tui_loop` relies on `curses.timeout()` to throttle `getch()`, but the Pyodide shim returned immediately when no key, causing a tight loop and pegged CPU in the browser.
+   - Fix: implement basic timeout semantics in `web_curses._Window.getch()` by sleeping for the configured timeout when input is empty and nodelay is off.
+   - Trade‑off: this is a synchronous sleep, so keypresses are only processed between ticks; acceptable for sub‑second UI while the longer‑term async driver remains on the backlog.
+   - Resolution: patched on 2025‑12‑11.
+
+**P1 – High‑impact follow‑ups**
+
+- **Coarse polling cap may oversample slow gauges**: `COARSE_STEP_MAX_SEC = 5m` means even hourly+ gauges are polled every ~5m in coarse regime. This diverges from the “~1 call per real update” story in slow‑gauge‑only scenarios. Recommendation: allow coarse steps to scale with cadence (e.g., cap at a fraction of mean interval) and add instrumentation for “calls per update.”
+- **Web hosting path clarity**: `web/main.js` loads modules via `../*.py`, so GH Pages must serve Python files at repo root, not only from `web/`. README should make this explicit or paths adjusted.
+- **No automated scheduler regression tests**: convert key scenarios in `scheduler_harness.py` into stdlib unit tests covering cadence convergence, fine‑window eligibility, and mixed‑gauge behavior.
+
+**P2 – Medium priority**
+
+- **Config/comment drift**: `config.toml` header still says “not wired,” but SITE_MAP/USGS base/forecast templates are live. Several fields are unused; update docs or wire selectively.
+- **State multi‑writer risk**: atomic writes prevent partial files, but concurrent runs can still lose updates; decide between lockfile or documented single‑writer guarantee.
+- **Defaults mismatch**: `PRIMARY_GAUGES` includes `EDGW1` while defaults omit it; either add to defaults or remove from primary list.
+- **Minor robustness**: preserve last non‑None stage/flow on partial reads; accept numeric strings in forecast parsing.
+
+**P3 – Nice‑to‑have**
+
+- Hoist some nested TUI helpers to top level (esp. for future async web driver).
+- Optional debug/control summary logging for cadence/latency tuning.
+- Add a simple state schema version for forward compatibility.

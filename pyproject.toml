@@ -20,5 +20,7 @@ dependencies = [
 streamvis = "streamvis:main"
 
 [tool.setuptools]
-py-modules = ["streamvis"]
-
+# streamvis is intentionally lightweight, but ships a few small support
+# modules (HTTP abstraction and optional web/TUI shims). Include them so
+# an installed `streamvis` console script works out of the box.
+py-modules = ["streamvis", "http_client", "web_curses", "web_entrypoint"]

@@ -92,3 +92,9 @@
   - Bridge `streamvis_state.json` to `localStorage` (`streamvis_state_json`) on startup/shutdown so browser sessions retain adaptive polling state.
 - Updated `README.md` with a “Running the TUI in a browser” section describing the Pyodide-based GitHub Pages flow and the fact that the existing curses TUI runs unchanged inside the browser.
   - Made the web shim responsive to the actual viewport by deriving rows/cols from the `#terminal` element’s size and font metrics, and added click/tap support on gauge rows by encoding per-row selection/toggle events into synthetic key codes consumed by `tui_loop`.
+
+## 2025-12-11 – P0 fixes from repo review
+
+- Fixed packaging so `pip install .` includes required peer modules (`http_client.py`, `web_curses.py`, `web_entrypoint.py`) and installed `streamvis` runs cleanly.
+- Added timeout-aware `getch()` behavior in `web_curses.py` to prevent Pyodide/browser TUI busy-looping.
+- Recorded a comprehensive, prioritized review and follow-ups in `notes/SCRUTINY.md` and design decisions in `notes/MEMORY.md`.

@@ -262,6 +262,12 @@ Design vs implementation:
 - **Geolocation UX/privacy**: Nearby prompts for browser location only when toggled on, but we do persist the last lat/lon in browser localStorage via state; acceptable for now but note if users want a “don’t store location” option.
 - **Layout pressure**: Nearby consumes up to 4 lines above the footer; on very small screens or in deep detail mode it may be clipped. This is intentional graceful degradation.
 
+## 2025-12-11 – Dynamic Nearby discovery risks
+
+- **API shape stability**: The NWIS Site Service uses legacy RDB; parser assumes standard column names (`site_no`, `station_nm`, `dec_lat_va`, `dec_long_va`). If USGS changes headers, Nearby discovery will silently fail soft.
+- **Dynamic ID collisions**: Dynamic gauges are assigned short `Uxxxxx` ids from site number suffix; collisions are unlikely but handled by numeric fallback. If users enable Nearby in dense areas, main table may grow beyond the original Snoqualmie focus.
+- **Rate/politeness**: Discovery is gated to at most once per 24h per state file, and only on Nearby enable or first location availability.
+
 ## 2025-12-10 – Meta scrutinizer refinement
 
 - **Critical – TUI trend crash when stages are absent** (`streamvis.py:1219`–`1225`): `dh` is only set when stage data exists, yet the flow trend divides by `dh` regardless. A flow-only gauge would raise `UnboundLocalError`. Seed `dh` from the time span of the flow samples (or default to `1.0`) before either trend calculation.

@@ -48,6 +48,13 @@ DEFAULT_BACKFILL_HOURS = 6               # Backfill this much history on startup
 PERIODIC_BACKFILL_INTERVAL_HOURS = 6     # How often to re-check recent history.
 PERIODIC_BACKFILL_LOOKBACK_HOURS = 6     # How much recent history to re-fetch on checks.
 
+# Nearby discovery behavior.
+NEARBY_DISCOVERY_RADIUS_MILES = 30.0
+NEARBY_DISCOVERY_MAX_RADIUS_MILES = 180.0
+NEARBY_DISCOVERY_EXPAND_FACTOR = 2.0
+NEARBY_DISCOVERY_MIN_INTERVAL_HOURS = 24.0
+DYNAMIC_GAUGE_PREFIX = "U"  # Prefix for dynamically-added gauges.
+
 # Fine/coarse polling control for adaptive scheduling.
 FINE_LATENCY_MAD_MAX_SEC = 60    # Only micro-poll if latency MAD <= 1 minute.
 FINE_WINDOW_MIN_SEC = 30         # Minimum half-width of fine window.
@@ -145,6 +152,7 @@ DEFAULT_SITE_MAP: Dict[str, str] = {
 }
 
 DEFAULT_USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
+DEFAULT_USGS_SITE_URL = "https://waterservices.usgs.gov/nwis/site/"
 
 
 def _site_map_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
@@ -466,7 +474,212 @@ def nearest_gauges(user_lat: float, user_lon: float, n: int = 3) -> List[tuple[s
     return [(gid, d) for d, gid in candidates[: max(0, int(n))]]
 
 
-def station_display_name(gauge_id: str) -> str:
+def _parse_usgs_site_rdb(text: str) -> List[Dict[str, Any]]:
+    """
+    Parse USGS NWIS site-service RDB into a list of station dicts.
+
+    RDB is a tab-delimited format with:
+      - comment lines starting with '#'
+      - header row of column names
+      - type row
+      - data rows
+    """
+    if not text:
+        return []
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    if len(lines) < 3:
+        return []
+    header = lines[0].split("\t")
+    idx = {name: i for i, name in enumerate(header)}
+    required = ("site_no", "station_nm", "dec_lat_va", "dec_long_va")
+    if not all(k in idx for k in required):
+        return []
+    data_lines = lines[2:]
+    out: List[Dict[str, Any]] = []
+    for ln in data_lines:
+        parts = ln.split("\t")
+        if len(parts) < len(header):
+            continue
+        try:
+            site_no = parts[idx["site_no"]].strip()
+            name = parts[idx["station_nm"]].strip()
+            lat = float(parts[idx["dec_lat_va"]])
+            lon = float(parts[idx["dec_long_va"]])
+        except Exception:
+            continue
+        if not site_no:
+            continue
+        out.append(
+            {
+                "site_no": site_no,
+                "station_nm": name or site_no,
+                "lat": lat,
+                "lon": lon,
+            }
+        )
+    return out
+
+
+def _bbox_for_radius(lat: float, lon: float, radius_miles: float) -> tuple[float, float, float, float]:
+    # Rough miles-per-degree conversions.
+    lat_deg = radius_miles / 69.0
+    lon_deg = radius_miles / (69.0 * max(0.2, math.cos(math.radians(lat))))
+    west = lon - lon_deg
+    east = lon + lon_deg
+    south = lat - lat_deg
+    north = lat + lat_deg
+    return west, south, east, north
+
+
+def fetch_usgs_sites_near(
+    user_lat: float,
+    user_lon: float,
+    radius_miles: float,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch active USGS stream gauges with IV data near a location.
+
+    Uses the NWIS Site Service (RDB format). Fail-soft on errors.
+    """
+    west, south, east, north = _bbox_for_radius(user_lat, user_lon, radius_miles)
+    params = {
+        "format": "rdb",
+        "bBox": f"{west:.5f},{south:.5f},{east:.5f},{north:.5f}",
+        "siteStatus": "active",
+        "hasDataTypeCd": "iv",
+        "siteType": "ST",
+        "parameterCd": "00060,00065",
+    }
+    try:
+        text = get_text(DEFAULT_USGS_SITE_URL, params=params, timeout=10.0)
+    except Exception:
+        return []
+    return _parse_usgs_site_rdb(text)
+
+
+def _dynamic_gauge_id(site_no: str, existing_ids: List[str]) -> str:
+    """
+    Derive a short, stable gauge_id for a USGS site_no, avoiding collisions.
+    """
+    suffix = site_no[-5:] if len(site_no) >= 5 else site_no
+    base = f"{DYNAMIC_GAUGE_PREFIX}{suffix}"
+    gauge_id = base[:6]
+    if gauge_id not in existing_ids:
+        return gauge_id
+    # Collision fallback: increment a numeric tail.
+    for i in range(1, 100):
+        cand = f"{DYNAMIC_GAUGE_PREFIX}{suffix[-4:]}{i}"[:6]
+        if cand not in existing_ids:
+            return cand
+    return f"{DYNAMIC_GAUGE_PREFIX}{site_no[-4:]}"[:6]
+
+
+def apply_dynamic_sites_from_state(state: Dict[str, Any]) -> None:
+    """
+    Merge any previously discovered dynamic sites into SITE_MAP/STATION_LOCATIONS.
+    """
+    meta = state.get("meta", {})
+    if not isinstance(meta, dict):
+        return
+    dyn = meta.get("dynamic_sites")
+    if not isinstance(dyn, dict):
+        return
+    global SITE_MAP, STATION_LOCATIONS
+    for gauge_id, info in dyn.items():
+        if not isinstance(info, dict):
+            continue
+        site_no = info.get("site_no")
+        if isinstance(site_no, str) and site_no:
+            SITE_MAP.setdefault(gauge_id, site_no)
+        try:
+            lat = float(info.get("lat"))
+            lon = float(info.get("lon"))
+        except Exception:
+            continue
+        STATION_LOCATIONS.setdefault(gauge_id, (lat, lon))
+
+
+def maybe_discover_nearby_gauges(
+    state: Dict[str, Any],
+    now: datetime,
+    user_lat: float,
+    user_lon: float,
+    n: int = 3,
+) -> List[str]:
+    """
+    Discover the N nearest USGS IV gauges to the user and add them to SITE_MAP/state if absent.
+
+    Returns the gauge_ids to display in Nearby order. Fail-soft on errors.
+    """
+    meta = state.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        return []
+
+    last_search = _parse_timestamp(meta.get("nearby_search_ts")) if isinstance(meta.get("nearby_search_ts"), str) else None
+    if last_search is not None:
+        elapsed_h = (now - last_search).total_seconds() / 3600.0
+        if elapsed_h < NEARBY_DISCOVERY_MIN_INTERVAL_HOURS:
+            ids = meta.get("nearby_gauges")
+            if isinstance(ids, list):
+                return [str(x) for x in ids if isinstance(x, str)]
+
+    radius = NEARBY_DISCOVERY_RADIUS_MILES
+    sites: List[Dict[str, Any]] = []
+    for _attempt in range(4):
+        sites = fetch_usgs_sites_near(user_lat, user_lon, radius)
+        if len(sites) >= n:
+            break
+        radius *= NEARBY_DISCOVERY_EXPAND_FACTOR
+        if radius > NEARBY_DISCOVERY_MAX_RADIUS_MILES:
+            break
+
+    if not sites:
+        return []
+
+    # Map existing USGS site numbers to gauge IDs.
+    existing_site_to_gauge = {site_no: gid for gid, site_no in SITE_MAP.items()}
+    existing_ids = list(SITE_MAP.keys())
+
+    ranked: List[tuple[float, Dict[str, Any]]] = []
+    for s in sites:
+        try:
+            dist = _haversine_miles(user_lat, user_lon, float(s["lat"]), float(s["lon"]))
+        except Exception:
+            continue
+        ranked.append((dist, s))
+    ranked.sort(key=lambda x: x[0])
+
+    dyn = meta.setdefault("dynamic_sites", {})
+    if not isinstance(dyn, dict):
+        dyn = {}
+        meta["dynamic_sites"] = dyn
+
+    chosen_ids: List[str] = []
+    for dist, s in ranked:
+        if len(chosen_ids) >= n:
+            break
+        site_no = str(s.get("site_no") or "")
+        if not site_no:
+            continue
+        gauge_id = existing_site_to_gauge.get(site_no)
+        if gauge_id is None:
+            gauge_id = _dynamic_gauge_id(site_no, existing_ids + chosen_ids)
+            SITE_MAP[gauge_id] = site_no
+            STATION_LOCATIONS[gauge_id] = (float(s["lat"]), float(s["lon"]))
+            dyn[gauge_id] = {
+                "site_no": site_no,
+                "station_nm": s.get("station_nm") or site_no,
+                "lat": float(s["lat"]),
+                "lon": float(s["lon"]),
+            }
+        chosen_ids.append(gauge_id)
+
+    meta["nearby_gauges"] = chosen_ids
+    meta["nearby_search_ts"] = now.isoformat()
+    return chosen_ids
+
+
+def station_display_name(gauge_id: str, state: Dict[str, Any] | None = None) -> str:
     stations_cfg = CONFIG.get("stations")
     if isinstance(stations_cfg, dict):
         entry = stations_cfg.get(gauge_id)
@@ -474,6 +687,18 @@ def station_display_name(gauge_id: str) -> str:
             name = entry.get("display_name")
             if isinstance(name, str) and name:
                 return name
+
+    if state is not None:
+        meta = state.get("meta", {})
+        if isinstance(meta, dict):
+            dyn = meta.get("dynamic_sites")
+            if isinstance(dyn, dict):
+                info = dyn.get(gauge_id)
+                if isinstance(info, dict):
+                    nm = info.get("station_nm")
+                    if isinstance(nm, str) and nm:
+                        return nm
+
     return gauge_id
 
 
@@ -551,6 +776,20 @@ def toggle_nearby(state: Dict[str, Any], args: argparse.Namespace | None = None)
             if maybe_request_user_location_web():
                 return "Nearby on (requesting location...)"
             return "Nearby on (no location yet)"
+
+        # We have a location; discover closest USGS gauges and add them.
+        try:
+            ids = maybe_discover_nearby_gauges(
+                state,
+                datetime.now(timezone.utc),
+                float(loc[0]),
+                float(loc[1]),
+                n=3,
+            )
+            if ids:
+                return "Nearby on (updated stations)"
+        except Exception:
+            pass
         return "Nearby on"
     return "Nearby off"
 
@@ -2260,7 +2499,21 @@ def draw_screen(
                     msg = "Closest stations: location unavailable"
                     stdscr.addstr(header_y, 0, msg[:max_x - 1], palette.get("dim", 0))
                 else:
-                    nearest = nearest_gauges(float(user_lat), float(user_lon), n=3)
+                    ids = meta.get("nearby_gauges") if isinstance(meta, dict) else None
+                    nearest: List[tuple[str, float]] = []
+                    if isinstance(ids, list) and ids:
+                        for gid_raw in ids:
+                            if not isinstance(gid_raw, str):
+                                continue
+                            coords = STATION_LOCATIONS.get(gid_raw)
+                            if coords:
+                                dist = _haversine_miles(float(user_lat), float(user_lon), coords[0], coords[1])
+                            else:
+                                dist = float("nan")
+                            nearest.append((gid_raw, dist))
+                    else:
+                        nearest = nearest_gauges(float(user_lat), float(user_lon), n=3)
+
                     if not nearest:
                         stdscr.addstr(
                             header_y,
@@ -2277,7 +2530,7 @@ def draw_screen(
                         )
                         max_rows = min(3, available - 1)
                         for i, (gid, dist) in enumerate(nearest[:max_rows]):
-                            name = station_display_name(gid)
+                            name = station_display_name(gid, state)
                             line = f"{gid:<6s} {dist:5.1f}mi {name}"
                             stdscr.addstr(
                                 header_y + 1 + i,
@@ -2344,6 +2597,7 @@ def tui_loop(args: argparse.Namespace) -> int:
     TUI_TABLE_START = 3
 
     def run(stdscr: Any) -> int:
+        nonlocal gauges
         curses.curs_set(0)
         # In TUI mode we want near-zero CPU usage when idle, so we rely on
         # a small blocking timeout for getch() instead of a busy loop.
@@ -2376,8 +2630,10 @@ def tui_loop(args: argparse.Namespace) -> int:
 
         state_path = Path(args.state_file)
         state = load_state(state_path)
+        apply_dynamic_sites_from_state(state)
         maybe_backfill_state(state, args.backfill_hours)
         seed_user_location_from_args(state, args)
+        gauges = ordered_gauges()
         save_state(state_path, state)
         readings: Dict[str, Dict[str, Any]] = {}
         selected_idx = 0
@@ -2429,7 +2685,15 @@ def tui_loop(args: argparse.Namespace) -> int:
                     save_state(state_path, state)
 
             if bool(state.get("meta", {}).get("nearby_enabled")):
-                refresh_user_location_web(state)
+                loc = refresh_user_location_web(state)
+                if loc is not None:
+                    maybe_discover_nearby_gauges(
+                        state,
+                        now,
+                        float(loc[0]),
+                        float(loc[1]),
+                        n=3,
+                    )
 
             draw_screen(
                 stdscr,
@@ -2460,6 +2724,9 @@ def tui_loop(args: argparse.Namespace) -> int:
                 toggle_row = footer_y - 1
                 if clicked_row == toggle_row:
                     status_msg = toggle_nearby(state, args)
+                    gauges = ordered_gauges()
+                    if gauges:
+                        selected_idx = min(selected_idx, len(gauges) - 1)
                     save_state(state_path, state)
                     continue
                 first_gauge_row = TUI_TABLE_START + 1
@@ -2481,6 +2748,9 @@ def tui_loop(args: argparse.Namespace) -> int:
                 status_msg = f"Chart metric: {chart_metric}"
             elif key in (ord("n"), ord("N")):
                 status_msg = toggle_nearby(state, args)
+                gauges = ordered_gauges()
+                if gauges:
+                    selected_idx = min(selected_idx, len(gauges) - 1)
                 save_state(state_path, state)
             elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
                 next_poll_at = datetime.now(timezone.utc)
@@ -2548,8 +2818,10 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
     try:
         with state_lock(state_path):
             state = load_state(state_path)
+            apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
             seed_user_location_from_args(state, args)
+            gauges = ordered_gauges()
             save_state(state_path, state)
             readings: Dict[str, Dict[str, Any]] = {}
             selected_idx = 0
@@ -2603,7 +2875,15 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                     save_state(state_path, state)
 
                 if bool(state.get("meta", {}).get("nearby_enabled")):
-                    refresh_user_location_web(state)
+                    loc = refresh_user_location_web(state)
+                    if loc is not None:
+                        maybe_discover_nearby_gauges(
+                            state,
+                            now,
+                            float(loc[0]),
+                            float(loc[1]),
+                            n=3,
+                        )
 
                 draw_screen(
                     stdscr,
@@ -2632,6 +2912,9 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                     toggle_row = footer_y - 1
                     if clicked_row == toggle_row:
                         status_msg = toggle_nearby(state, args)
+                        gauges = ordered_gauges()
+                        if gauges:
+                            selected_idx = min(selected_idx, len(gauges) - 1)
                         save_state(state_path, state)
                         await asyncio.sleep(0)
                         continue
@@ -2658,6 +2941,9 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                     status_msg = f"Alerts: {'on' if update_alert else 'off'}"
                 elif key in (ord("n"), ord("N")):
                     status_msg = toggle_nearby(state, args)
+                    gauges = ordered_gauges()
+                    if gauges:
+                        selected_idx = min(selected_idx, len(gauges) - 1)
                     save_state(state_path, state)
                 elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
                     next_poll_at = datetime.now(timezone.utc)
@@ -2677,6 +2963,7 @@ def adaptive_loop(args: argparse.Namespace) -> int:
     try:
         with state_lock(state_path):
             state = load_state(state_path)
+            apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
             save_state(state_path, state)
             retry_wait = args.min_retry_seconds
@@ -2847,6 +3134,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with state_lock(state_path):
             state = load_state(state_path)
+            apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
             save_state(state_path, state)
 

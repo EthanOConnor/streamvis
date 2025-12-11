@@ -172,3 +172,4 @@
   - Persist only the toggle state and last known lat/lon in `state.meta` so the layout is consistent across sessions; location is refreshed opportunistically in web mode.
 - **Data**:
   - Maintain built‑in decimal lat/lon defaults for core Snoqualmie gauges (and CONW1) and allow per‑station override via `config.toml` `lat`/`lon`.
+  - When Nearby is enabled and a location is available, dynamically discover the three nearest active USGS IV stream stations via the NWIS Site Service (`/nwis/site/` RDB), add them to `SITE_MAP`/state as needed using a short `Uxxxxx` gauge id, and persist them under `meta.dynamic_sites` / `meta.nearby_gauges` so they survive reloads.

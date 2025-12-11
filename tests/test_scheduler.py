@@ -146,6 +146,22 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(900.0 < mean_interval < 1800.0)
         self.assertAlmostEqual(mean_interval, 1200.0, delta=250.0)
 
+    def test_parse_usgs_site_rdb_basic(self) -> None:
+        text = (
+            "# comment\n"
+            "agency_cd\tsite_no\tstation_nm\tdec_lat_va\tdec_long_va\n"
+            "5s\t15s\t50s\t10s\t10s\n"
+            "USGS\t12141300\tTest River\t47.5\t-121.6\n"
+        )
+        sites = sv._parse_usgs_site_rdb(text)  # type: ignore[attr-defined]
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0]["site_no"], "12141300")
+        self.assertAlmostEqual(sites[0]["lat"], 47.5)
+
+    def test_dynamic_gauge_id_collision(self) -> None:
+        gid1 = sv._dynamic_gauge_id("12345678", ["U5678", "U56781"])  # type: ignore[attr-defined]
+        self.assertTrue(gid1.startswith("U"))
+
 
 if __name__ == "__main__":
     unittest.main()

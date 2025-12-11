@@ -157,3 +157,7 @@
 
 - Added per‑station lat/lon metadata (defaults in code + floats in `config.toml`) and a small haversine distance helper.
 - Implemented a `[n] Nearby` text toggle in the TUI (native + web) that, when enabled, shows the three closest gauges to the user and prompts for browser geolocation under Pyodide.
+
+## 2025-12-11 – Dynamic Nearby discovery
+
+- Extended Nearby mode to query the USGS NWIS Site Service for active IV stream gauges near the user, select the 3 closest, and add/persist them as dynamic stations (`Uxxxxx` ids) when not already tracked.

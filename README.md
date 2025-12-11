@@ -72,6 +72,7 @@ Options:
 - `--max-retry-seconds` (default 300): ceiling when backing off on errors.
 - `--backfill-hours` (default 6): on startup, backfill this many hours of recent history from USGS IV to seed the cadence learner and charts (0 disables).
 - `--user-lat` / `--user-lon`: optional manual location for the Nearby gauges section in native TUI mode.
+- Nearby mode (`n` in TUI): when enabled and a location is available, `streamvis` queries the USGS Site Service for active IV stream gauges near you, adds the three closest to the session/state if they aren’t already tracked, and shows them in a small “Closest stations” panel.
 - `--ui-tick-sec` (default 0.15): UI refresh tick in TUI mode; raise this on slow devices/browsers to reduce CPU.
 - `--no-update-alert`: in TUI mode, disable the bell/flash alert when new data is fetched.
 

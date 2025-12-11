@@ -1716,14 +1716,14 @@ def tui_loop(args: argparse.Namespace) -> int:
         if footer_y >= 0:
             next_multi = _fmt_rel(now, next_poll_at) if next_poll_at else "pending"
             footer = (
-                "[↑/↓] select  [Enter] details  [c] toggle chart metric  [r] refresh  [f] force refetch  [q] quit  "
+                "[↑/↓] select  [Enter] details  [c] toggle chart metric  [b] toggle alert  [r] refresh  [f] force refetch  [q] quit  "
                 f"Next fetch: {next_multi}  |  {status_msg}"
             )
             stdscr.addstr(footer_y, 0, footer[:max_x - 1], palette.get("dim", 0))
 
         info_y = footer_y + 1
         if 0 <= info_y < max_y:
-            info_line = f"Mode: TUI adaptive | State: {args.state_file}"
+            info_line = f"Mode: TUI adaptive | Alerts: {'on' if getattr(args, 'update_alert', True) else 'off'} | State: {args.state_file}"
             stdscr.addstr(info_y, 0, info_line[:max_x - 1], palette.get("dim", 0))
 
         stdscr.refresh()
@@ -1767,6 +1767,7 @@ def tui_loop(args: argparse.Namespace) -> int:
         next_poll_at = datetime.now(timezone.utc)
         retry_wait = args.min_retry_seconds
         detail_mode = False
+        update_alert = getattr(args, "update_alert", True)
 
         while True:
             now = datetime.now(timezone.utc)
@@ -1776,7 +1777,7 @@ def tui_loop(args: argparse.Namespace) -> int:
                 if fetched:
                     readings = fetched
                     retry_wait = args.min_retry_seconds
-                    update_state_with_readings(state, readings, poll_ts=now)
+                    updates = update_state_with_readings(state, readings, poll_ts=now)
                     maybe_refresh_forecasts(state, args)
                     maybe_refresh_nwrfc(state, args)
                     save_state(state_path, state)
@@ -1789,6 +1790,15 @@ def tui_loop(args: argparse.Namespace) -> int:
                     state["meta"]["last_success_at"] = now.isoformat()
                     state["meta"]["next_poll_at"] = next_poll_at.isoformat()
                     save_state(state_path, state)
+                    if update_alert and any(updates.values()):
+                        try:
+                            curses.flash()
+                        except Exception:
+                            pass
+                        try:
+                            curses.beep()
+                        except Exception:
+                            pass
                 else:
                     status_msg = "Fetch failed; backing off."
                     retry_wait = min(args.max_retry_seconds, retry_wait * 2)
@@ -1954,6 +1964,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             "(currently GARW1) to compare observed stage/flow against USGS."
         ),
     )
+    parser.add_argument(
+        "--no-update-alert",
+        dest="update_alert",
+        action="store_false",
+        help="Disable bell/flash when new data is fetched in TUI mode.",
+    )
+    parser.set_defaults(update_alert=True)
     return parser.parse_args(argv)
 
 

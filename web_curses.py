@@ -56,6 +56,16 @@ def curs_set(visibility: int) -> None:
     pass
 
 
+def flash() -> int:
+    # No-op visual bell for the web shim; real terminals handle this via curses.
+    return 0
+
+
+def beep() -> int:
+    # No-op audible bell for the web shim.
+    return 0
+
+
 def _measure_terminal() -> Tuple[int, int]:
     """
     Estimate terminal rows/cols from the DOM size and font metrics so the

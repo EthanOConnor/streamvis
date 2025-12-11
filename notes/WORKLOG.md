@@ -152,3 +152,8 @@
 ## 2025-12-11 – Web favicon
 
 - Added a simple STREAMVIS favicon (`web/favicon.svg`) with Snoqualmie wave lines and a gauge marker, and wired it into `web/index.html`.
+
+## 2025-12-11 – Nearby stations toggle
+
+- Added per‑station lat/lon metadata (defaults in code + floats in `config.toml`) and a small haversine distance helper.
+- Implemented a `[n] Nearby` text toggle in the TUI (native + web) that, when enabled, shows the three closest gauges to the user and prompts for browser geolocation under Pyodide.

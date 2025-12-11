@@ -188,6 +188,44 @@ def ordered_gauges() -> List[str]:
 
 USGS_IV_URL = _usgs_iv_url_from_config(CONFIG)
 
+# Default station locations (lat, lon) in decimal degrees.
+# These are used for the "Nearby" UI feature and can be overridden per-station
+# via config.toml `lat` / `lon` fields.
+DEFAULT_STATION_LOCATIONS: Dict[str, tuple[float, float]] = {
+    "TANW1": (47.485912, -121.647864),       # USGS 12141300
+    "GARW1": (47.4151086, -121.5873213),    # USGS 12143400
+    "EDGW1": (47.4527778, -121.7166667),    # USGS 12143600 (DMS → decimal)
+    "SQUW1": (47.5451019, -121.8423360),    # USGS 12144500
+    "CRNW1": (47.6659340, -121.9253969),    # USGS 12149000
+    "CONW1": (48.5382169, -121.7489830),    # USGS 12194000
+}
+
+
+def _station_locations_from_config(cfg: Dict[str, Any]) -> Dict[str, tuple[float, float]]:
+    stations = cfg.get("stations")
+    if not isinstance(stations, dict):
+        return {}
+    out: Dict[str, tuple[float, float]] = {}
+    for gauge_id, entry in stations.items():
+        if not isinstance(entry, dict):
+            continue
+        lat_raw = entry.get("lat") or entry.get("latitude")
+        lon_raw = entry.get("lon") or entry.get("longitude")
+        try:
+            lat = float(lat_raw)
+            lon = float(lon_raw)
+        except Exception:
+            continue
+        if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+            out[str(gauge_id)] = (lat, lon)
+    return out
+
+
+STATION_LOCATIONS: Dict[str, tuple[float, float]] = {
+    **DEFAULT_STATION_LOCATIONS,
+    **_station_locations_from_config(CONFIG),
+}
+
 # Optional NW RFC text-plot endpoint used for cross-checking observed
 # stage/flow for selected stations. We treat USGS IV as authoritative
 # and use NW RFC as a secondary view for comparison.
@@ -394,6 +432,127 @@ def _ewma(current_mean: float, new_value: float, alpha: float = EWMA_ALPHA) -> f
     if current_mean <= 0:
         return new_value
     return (1 - alpha) * current_mean + alpha * new_value
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Great-circle distance between two points in miles.
+    """
+    r_miles = 3958.8
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1 - a)))
+    return r_miles * c
+
+
+def nearest_gauges(user_lat: float, user_lon: float, n: int = 3) -> List[tuple[str, float]]:
+    """
+    Return the n nearest gauges to the given user location.
+
+    Returns a list of (gauge_id, distance_miles) sorted nearest-first.
+    """
+    candidates: List[tuple[float, str]] = []
+    for gauge_id, coords in STATION_LOCATIONS.items():
+        try:
+            lat, lon = coords
+            dist = _haversine_miles(user_lat, user_lon, float(lat), float(lon))
+            candidates.append((dist, gauge_id))
+        except Exception:
+            continue
+    candidates.sort(key=lambda x: x[0])
+    return [(gid, d) for d, gid in candidates[: max(0, int(n))]]
+
+
+def station_display_name(gauge_id: str) -> str:
+    stations_cfg = CONFIG.get("stations")
+    if isinstance(stations_cfg, dict):
+        entry = stations_cfg.get(gauge_id)
+        if isinstance(entry, dict):
+            name = entry.get("display_name")
+            if isinstance(name, str) and name:
+                return name
+    return gauge_id
+
+
+def seed_user_location_from_args(state: Dict[str, Any], args: argparse.Namespace) -> None:
+    lat = getattr(args, "user_lat", None)
+    lon = getattr(args, "user_lon", None)
+    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+        meta = state.setdefault("meta", {})
+        if isinstance(meta, dict):
+            meta["user_lat"] = float(lat)
+            meta["user_lon"] = float(lon)
+
+
+def refresh_user_location_web(state: Dict[str, Any]) -> tuple[float, float] | None:
+    """
+    If running under Pyodide and JS geolocation has been provided, copy it into
+    state.meta and return (lat, lon). Otherwise return None.
+    """
+    try:
+        from js import window  # type: ignore[import]
+    except Exception:
+        return None
+    try:
+        loc = getattr(window, "streamvisUserLocation", None)
+        lat = getattr(loc, "lat", None) if loc is not None else None
+        lon = getattr(loc, "lon", None) if loc is not None else None
+        if lat is None or lon is None:
+            return None
+        lat_f = float(lat)
+        lon_f = float(lon)
+        meta = state.setdefault("meta", {})
+        if isinstance(meta, dict):
+            meta["user_lat"] = lat_f
+            meta["user_lon"] = lon_f
+        return lat_f, lon_f
+    except Exception:
+        return None
+
+
+def maybe_request_user_location_web() -> bool:
+    """
+    Best-effort trigger of browser geolocation prompt when running in Pyodide.
+    Returns True if a request was made.
+    """
+    try:
+        from js import window  # type: ignore[import]
+    except Exception:
+        return False
+    try:
+        req = getattr(window, "streamvisRequestLocation", None)
+        if req:
+            req()
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def toggle_nearby(state: Dict[str, Any], args: argparse.Namespace | None = None) -> str:
+    """
+    Toggle Nearby mode in state.meta. When enabling, attempt to seed location
+    from args or request web geolocation.
+    Returns a short status message for the UI.
+    """
+    meta = state.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        return ""
+    enabled = not bool(meta.get("nearby_enabled", False))
+    meta["nearby_enabled"] = enabled
+    if enabled:
+        if args is not None:
+            seed_user_location_from_args(state, args)
+        loc = refresh_user_location_web(state)
+        if loc is None:
+            if maybe_request_user_location_web():
+                return "Nearby on (requesting location...)"
+            return "Nearby on (no location yet)"
+        return "Nearby on"
+    return "Nearby off"
 
 
 def _snap_delta_to_cadence(delta_sec: float) -> tuple[float | None, int | None]:
@@ -2074,11 +2233,62 @@ def draw_screen(
                 stats = f"{chart_metric}: min {min(chart_vals):.2f}  max {max(chart_vals):.2f}  Δ {delta:+.2f}"
                 stdscr.addstr(detail_y + 5, 0, stats[:max_x - 1], palette.get("dim", 0))
 
+    # Nearby gauges section (optional).
+    nearby_enabled = bool(state.get("meta", {}).get("nearby_enabled"))
+    meta = state.get("meta", {})
+    user_lat = meta.get("user_lat") if isinstance(meta, dict) else None
+    user_lon = meta.get("user_lon") if isinstance(meta, dict) else None
+
     footer_y = max_y - 2
+    toggle_y = footer_y - 1
+    if toggle_y > detail_y and 0 <= toggle_y < max_y:
+        on_off = "ON" if nearby_enabled else "off"
+        toggle_line = f"[n] Nearby: {on_off}"
+        if nearby_enabled and not (
+            isinstance(user_lat, (int, float)) and isinstance(user_lon, (int, float))
+        ):
+            toggle_line += " (allow location)"
+        stdscr.addstr(toggle_y, 0, toggle_line[:max_x - 1], palette.get("dim", 0))
+
+        if nearby_enabled:
+            available = toggle_y - detail_y - 1
+            if available >= 2:
+                header_y = toggle_y - min(available, 4)
+                if not (
+                    isinstance(user_lat, (int, float)) and isinstance(user_lon, (int, float))
+                ):
+                    msg = "Closest stations: location unavailable"
+                    stdscr.addstr(header_y, 0, msg[:max_x - 1], palette.get("dim", 0))
+                else:
+                    nearest = nearest_gauges(float(user_lat), float(user_lon), n=3)
+                    if not nearest:
+                        stdscr.addstr(
+                            header_y,
+                            0,
+                            "Closest stations: unavailable"[:max_x - 1],
+                            palette.get("dim", 0),
+                        )
+                    else:
+                        stdscr.addstr(
+                            header_y,
+                            0,
+                            "Closest stations to you:"[:max_x - 1],
+                            palette.get("dim", 0),
+                        )
+                        max_rows = min(3, available - 1)
+                        for i, (gid, dist) in enumerate(nearest[:max_rows]):
+                            name = station_display_name(gid)
+                            line = f"{gid:<6s} {dist:5.1f}mi {name}"
+                            stdscr.addstr(
+                                header_y + 1 + i,
+                                0,
+                                line[:max_x - 1],
+                                palette.get("normal", 0),
+                            )
     if footer_y >= 0:
         next_multi = _fmt_rel(now, next_poll_at) if next_poll_at else "pending"
         footer = (
-            "[↑/↓] select  [Enter] details  [c] toggle chart metric  [b] toggle alert  [r] refresh  [f] force refetch  [q] quit  "
+            "[↑/↓] select  [Enter] details  [c] toggle chart metric  [b] toggle alert  [n] nearby  [r] refresh  [f] force refetch  [q] quit  "
             f"Next fetch: {next_multi}  |  {status_msg}"
         )
         stdscr.addstr(footer_y, 0, footer[:max_x - 1], palette.get("dim", 0))
@@ -2167,6 +2377,7 @@ def tui_loop(args: argparse.Namespace) -> int:
         state_path = Path(args.state_file)
         state = load_state(state_path)
         maybe_backfill_state(state, args.backfill_hours)
+        seed_user_location_from_args(state, args)
         save_state(state_path, state)
         readings: Dict[str, Dict[str, Any]] = {}
         selected_idx = 0
@@ -2217,6 +2428,9 @@ def tui_loop(args: argparse.Namespace) -> int:
                     state["meta"]["next_poll_at"] = next_poll_at.isoformat()
                     save_state(state_path, state)
 
+            if bool(state.get("meta", {}).get("nearby_enabled")):
+                refresh_user_location_web(state)
+
             draw_screen(
                 stdscr,
                 curses,
@@ -2241,6 +2455,13 @@ def tui_loop(args: argparse.Namespace) -> int:
             # keys in the range [3000, 4000) mean "click on row N".
             if 3000 <= key < 4000:
                 clicked_row = key - 3000
+                max_y, _max_x = stdscr.getmaxyx()
+                footer_y = max_y - 2
+                toggle_row = footer_y - 1
+                if clicked_row == toggle_row:
+                    status_msg = toggle_nearby(state, args)
+                    save_state(state_path, state)
+                    continue
                 first_gauge_row = TUI_TABLE_START + 1
                 target = clicked_row - first_gauge_row
                 if 0 <= target < len(gauges):
@@ -2258,6 +2479,9 @@ def tui_loop(args: argparse.Namespace) -> int:
             elif key in (ord("c"), ord("C")):
                 chart_metric = "flow" if chart_metric == "stage" else "stage"
                 status_msg = f"Chart metric: {chart_metric}"
+            elif key in (ord("n"), ord("N")):
+                status_msg = toggle_nearby(state, args)
+                save_state(state_path, state)
             elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
                 next_poll_at = datetime.now(timezone.utc)
                 if key in (ord("f"), ord("F")):
@@ -2325,6 +2549,7 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
         with state_lock(state_path):
             state = load_state(state_path)
             maybe_backfill_state(state, args.backfill_hours)
+            seed_user_location_from_args(state, args)
             save_state(state_path, state)
             readings: Dict[str, Dict[str, Any]] = {}
             selected_idx = 0
@@ -2371,11 +2596,14 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                                 pass
                     else:
                         status_msg = "Fetch failed; backing off."
-                        retry_wait = min(args.max_retry_seconds, retry_wait * 2)
-                        next_poll_at = now + timedelta(seconds=retry_wait)
-                        state["meta"]["last_failure_at"] = now.isoformat()
-                        state["meta"]["next_poll_at"] = next_poll_at.isoformat()
-                        save_state(state_path, state)
+                    retry_wait = min(args.max_retry_seconds, retry_wait * 2)
+                    next_poll_at = now + timedelta(seconds=retry_wait)
+                    state["meta"]["last_failure_at"] = now.isoformat()
+                    state["meta"]["next_poll_at"] = next_poll_at.isoformat()
+                    save_state(state_path, state)
+
+                if bool(state.get("meta", {}).get("nearby_enabled")):
+                    refresh_user_location_web(state)
 
                 draw_screen(
                     stdscr,
@@ -2399,6 +2627,14 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                     return 0
                 if 3000 <= key < 4000:
                     clicked_row = key - 3000
+                    max_y, _max_x = stdscr.getmaxyx()
+                    footer_y = max_y - 2
+                    toggle_row = footer_y - 1
+                    if clicked_row == toggle_row:
+                        status_msg = toggle_nearby(state, args)
+                        save_state(state_path, state)
+                        await asyncio.sleep(0)
+                        continue
                     first_gauge_row = TUI_TABLE_START + 1
                     target = clicked_row - first_gauge_row
                     if 0 <= target < len(gauges):
@@ -2420,6 +2656,9 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                 elif key in (ord("b"), ord("B")):
                     update_alert = not update_alert
                     status_msg = f"Alerts: {'on' if update_alert else 'off'}"
+                elif key in (ord("n"), ord("N")):
+                    status_msg = toggle_nearby(state, args)
+                    save_state(state_path, state)
                 elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
                     next_poll_at = datetime.now(timezone.utc)
                     if key in (ord("f"), ord("F")):
@@ -2552,6 +2791,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             "On start, backfill this many hours of recent history from USGS IV "
             f"(default {DEFAULT_BACKFILL_HOURS}; 0 to disable)."
         ),
+    )
+    parser.add_argument(
+        "--user-lat",
+        type=float,
+        default=None,
+        help="Optional user latitude for Nearby gauges (native TUI).",
+    )
+    parser.add_argument(
+        "--user-lon",
+        type=float,
+        default=None,
+        help="Optional user longitude for Nearby gauges (native TUI).",
     )
     parser.add_argument(
         "--chart-metric",

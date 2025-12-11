@@ -8,6 +8,35 @@ const loadingProgressEl = document.getElementById("loading-progress");
 // Global key queue consumed by web_curses.getch().
 window.streamvisKeyQueue = [];
 
+// User location bridge for the Nearby feature.
+window.streamvisUserLocation = null;
+window.streamvisLocationError = null;
+window.streamvisRequestLocation = function requestStreamvisLocation() {
+  if (!navigator.geolocation) {
+    window.streamvisLocationError = "geolocation unavailable";
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      window.streamvisUserLocation = {
+        lat: pos.coords.latitude,
+        lon: pos.coords.longitude,
+        accuracy: pos.coords.accuracy,
+        ts: Date.now(),
+      };
+      window.streamvisLocationError = null;
+    },
+    (err) => {
+      window.streamvisLocationError = err && err.message ? err.message : String(err);
+    },
+    {
+      enableHighAccuracy: false,
+      maximumAge: 10 * 60 * 1000,
+      timeout: 5000,
+    }
+  );
+};
+
 let measureEl = null;
 function measureCharFactor(sampleFontPx = 14) {
   if (!measureEl) {

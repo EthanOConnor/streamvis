@@ -257,6 +257,11 @@ Design vs implementation:
   - If a gauge has a stable cadence that is not a 15‑minute multiple (rare), it should remain in EWMA mode, but a sustained near‑grid cadence could still “snap” incorrectly if jitter stays within tolerance; tune thresholds if this appears.
   - We do not yet estimate a separate phase offset; predictions are anchored to the last observed timestamp. If we see systematic phase drift (e.g., timestamps jittering around a boundary), consider adding a robust per‑gauge phase estimator. Logged in backlog if needed.
 
+## 2025-12-11 – Nearby feature risks
+
+- **Geolocation UX/privacy**: Nearby prompts for browser location only when toggled on, but we do persist the last lat/lon in browser localStorage via state; acceptable for now but note if users want a “don’t store location” option.
+- **Layout pressure**: Nearby consumes up to 4 lines above the footer; on very small screens or in deep detail mode it may be clipped. This is intentional graceful degradation.
+
 ## 2025-12-10 – Meta scrutinizer refinement
 
 - **Critical – TUI trend crash when stages are absent** (`streamvis.py:1219`–`1225`): `dh` is only set when stage data exists, yet the flow trend divides by `dh` regardless. A flow-only gauge would raise `UnboundLocalError`. Seed `dh` from the time span of the flow samples (or default to `1.0`) before either trend calculation.

@@ -161,4 +161,14 @@
     - A low‑frequency periodic backfill check (~6h cadence, 6h lookback) re-aligns state if updates were missed or the upstream cadence changes.
   - Trade‑offs:
     - Slightly more startup bandwidth (one multi‑site history call) in exchange for fast convergence and lower steady‑state call rates.
-    - The learner will still track non‑grid cadences via EWMA if fit confidence is low.
+  - The learner will still track non‑grid cadences via EWMA if fit confidence is low.
+
+## 2025-12-11 – Nearby gauges UX
+
+- **Goal**: Provide a lightweight “nearby” view in text TUI, especially for mobile Safari, without adding UI deps.
+- **Decision**:
+  - Render a fixed `[n] Nearby` toggle line just above the footer; when enabled, reserve up to 4 lines above it for a “Closest stations to you” list (3 rows).
+  - Use browser geolocation only on demand: enabling Nearby triggers `navigator.geolocation.getCurrentPosition` via a JS bridge; native TUI supports manual `--user-lat/--user-lon`.
+  - Persist only the toggle state and last known lat/lon in `state.meta` so the layout is consistent across sessions; location is refreshed opportunistically in web mode.
+- **Data**:
+  - Maintain built‑in decimal lat/lon defaults for core Snoqualmie gauges (and CONW1) and allow per‑station override via `config.toml` `lat`/`lon`.

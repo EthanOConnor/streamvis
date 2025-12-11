@@ -71,6 +71,7 @@ Options:
 - `--min-retry-seconds` (default 60): retry delay if the prediction was early.
 - `--max-retry-seconds` (default 300): ceiling when backing off on errors.
 - `--backfill-hours` (default 6): on startup, backfill this many hours of recent history from USGS IV to seed the cadence learner and charts (0 disables).
+- `--user-lat` / `--user-lon`: optional manual location for the Nearby gauges section in native TUI mode.
 - `--ui-tick-sec` (default 0.15): UI refresh tick in TUI mode; raise this on slow devices/browsers to reduce CPU.
 - `--no-update-alert`: in TUI mode, disable the bell/flash alert when new data is fetched.
 

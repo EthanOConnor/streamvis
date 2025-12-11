@@ -95,4 +95,18 @@
 - **Calls‑per‑update instrumentation**:
   - We persist `no_update_polls` per gauge to count consecutive polls with no new timestamp.
   - On a real update, we record `last_polls_per_update = no_update_polls + 1` and update `polls_per_update_ewma` using the standard EWMA alpha.
-  - Expanded TUI detail surfaces both values so we can tune scheduler constants without extra dependencies or heavy logging.
+- Expanded TUI detail surfaces both values so we can tune scheduler constants without extra dependencies or heavy logging.
+
+## 2025-12-11 – State locking and partial-value policy
+
+- **Single-writer state lock**:
+  - Decision: use a sibling `.lock` file plus `fcntl.flock(LOCK_EX|LOCK_NB)` to enforce one writer per state file in native modes.
+  - Behavior: if another `streamvis` instance is already using the same `--state-file`, the new instance exits with a clear stderr message; on platforms without `fcntl` (Windows/Pyodide) the lock is a no-op.
+  - Rationale: protects adaptive cadence/latency history from silent lost updates while keeping implementation stdlib-only.
+
+- **Partial USGS reads**:
+  - Decision: do not overwrite `last_stage` / `last_flow` with `None` when a fetch omits one parameter; preserve the last known non-None value.
+  - History entries for new timestamps still record missing metrics as `None` so same-timestamp refreshes can fill them in later.
+
+- **Forecast numeric coercion**:
+  - Decision: accept numeric strings in forecast payloads by coercing to float; treat non-numeric strings as missing.

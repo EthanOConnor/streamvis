@@ -287,10 +287,10 @@ Design vs implementation:
 
 **P2 – Medium priority**
 
-- **Config/comment drift**: `config.toml` header still says “not wired,” but SITE_MAP/USGS base/forecast templates are live. Several fields are unused; update docs or wire selectively.
-- **State multi‑writer risk**: atomic writes prevent partial files, but concurrent runs can still lose updates; decide between lockfile or documented single‑writer guarantee.
-- **Defaults mismatch**: `PRIMARY_GAUGES` includes `EDGW1` while defaults omit it; either add to defaults or remove from primary list.
-- **Minor robustness**: preserve last non‑None stage/flow on partial reads; accept numeric strings in forecast parsing.
+- **Config/comment drift** (partially resolved 2025‑12‑11): updated `config.toml` header to reflect live wiring; several fields remain advisory/future‑facing.
+- **State multi‑writer risk** (resolved 2025‑12‑11): added a best‑effort single‑writer lock via `fcntl` and documented the behavior in README.
+- **Defaults mismatch** (resolved 2025‑12‑11): added `EDGW1` to built‑in defaults so `PRIMARY_GAUGES` is consistent out of the box.
+- **Minor robustness** (resolved 2025‑12‑11): preserve last non‑None stage/flow on partial reads and coerce numeric forecast strings.
 
 **P3 – Nice‑to‑have**
 

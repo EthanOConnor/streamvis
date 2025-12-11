@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import sys
@@ -12,6 +13,11 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from http_client import get_json, get_text
+
+try:
+    import fcntl  # type: ignore[import]
+except Exception:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 STATE_FILE_DEFAULT = Path.home() / ".streamvis_state.json"
 # Start with a conservative 8-minute cadence and only speed up if
@@ -118,6 +124,7 @@ CONFIG: Dict[str, Any] = _load_toml_config(CONFIG_PATH)
 DEFAULT_SITE_MAP: Dict[str, str] = {
     "TANW1": "12141300",  # Middle Fork Snoqualmie R near Tanner
     "GARW1": "12143400",  # SF Snoqualmie R ab Alice Cr nr Garcia
+    "EDGW1": "12143600",  # SF Snoqualmie R at Edgewick
     "SQUW1": "12144500",  # Snoqualmie R near Snoqualmie
     "CRNW1": "12149000",  # Snoqualmie R near Carnation
 }
@@ -372,6 +379,61 @@ def _ewma(current_mean: float, new_value: float, alpha: float = EWMA_ALPHA) -> f
     if current_mean <= 0:
         return new_value
     return (1 - alpha) * current_mean + alpha * new_value
+
+
+class StateLockError(RuntimeError):
+    pass
+
+
+class _StateFileLock:
+    """
+    Best-effort single-writer lock for a given state file.
+
+    Uses a sibling `.lock` file and `fcntl.flock` when available. On platforms
+    without `fcntl` (e.g., Windows, Pyodide), this becomes a no-op.
+    """
+
+    def __init__(self, state_path: Path) -> None:
+        self._lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+        self._fh = None
+
+    def __enter__(self) -> "_StateFileLock":
+        if fcntl is None:
+            return self
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = self._lock_path.open("w", encoding="utf-8")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception as exc:
+            fh.close()
+            raise StateLockError(
+                f"State file is locked by another streamvis process: {self._lock_path}"
+            ) from exc
+        self._fh = fh
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fh is None or fcntl is None:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
+
+def state_lock(state_path: Path) -> contextlib.AbstractContextManager:
+    """
+    Return a context manager that holds a single-writer lock for `state_path`.
+    On platforms without file-lock support this is a no-op.
+    """
+    if fcntl is None:
+        return contextlib.nullcontext()
+    return _StateFileLock(state_path)
 
 
 def load_state(state_path: Path) -> Dict[str, Any]:
@@ -671,6 +733,17 @@ def _forecast_template_for_gauge(gauge_id: str, site_no: str, args: argparse.Nam
     return ""
 
 
+def _coerce_float(val: Any) -> float | None:
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except Exception:
+            return None
+    return None
+
+
 def fetch_forecast_series(
     forecast_base: str,
     gauge_id: str,
@@ -734,8 +807,8 @@ def fetch_forecast_series(
 
         point = {
             "ts": dt.isoformat(),
-            "stage": float(stage) if isinstance(stage, (int, float)) else None,
-            "flow": float(flow) if isinstance(flow, (int, float)) else None,
+            "stage": _coerce_float(stage),
+            "flow": _coerce_float(flow),
         }
         points.append(point)
 
@@ -1135,8 +1208,10 @@ def update_state_with_readings(
             # Still keep last known values in sync with the latest reading.
             stage_now = reading.get("stage")
             flow_now = reading.get("flow")
-            g_state["last_stage"] = stage_now
-            g_state["last_flow"] = flow_now
+            if stage_now is not None:
+                g_state["last_stage"] = stage_now
+            if flow_now is not None:
+                g_state["last_flow"] = flow_now
 
             # If this reading shares the same timestamp as our last stored
             # point (e.g., one parameter was updated slightly later by USGS),
@@ -1173,16 +1248,20 @@ def update_state_with_readings(
         g_state["mean_interval_sec"] = max(prev_mean, MIN_UPDATE_GAP_SEC)
         if last_delta is not None:
             g_state["last_delta_sec"] = last_delta
-        g_state["last_stage"] = reading.get("stage")
-        g_state["last_flow"] = reading.get("flow")
+        stage_now = reading.get("stage")
+        flow_now = reading.get("flow")
+        if stage_now is not None:
+            g_state["last_stage"] = stage_now
+        if flow_now is not None:
+            g_state["last_flow"] = flow_now
         history = g_state.setdefault("history", [])
         # Append at most one history point per new observation timestamp.
         if not history or history[-1].get("ts") != observed_at.isoformat():
             history.append(
                 {
                     "ts": observed_at.isoformat(),
-                    "stage": reading.get("stage"),
-                    "flow": reading.get("flow"),
+                    "stage": stage_now,
+                    "flow": flow_now,
                 }
             )
         if len(history) > HISTORY_LIMIT:
@@ -1891,61 +1970,72 @@ def tui_loop(args: argparse.Namespace) -> int:
 
         return 0
 
-    return curses.wrapper(run)
+    state_path = Path(args.state_file)
+    try:
+        with state_lock(state_path):
+            return curses.wrapper(run)
+    except StateLockError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def adaptive_loop(args: argparse.Namespace) -> int:
     state_path = Path(args.state_file)
-    state = load_state(state_path)
-    maybe_backfill_state(state, args.backfill_hours)
-    save_state(state_path, state)
-    retry_wait = args.min_retry_seconds
-    next_poll_at: datetime | None = None
-
-    while True:
-        now = datetime.now(timezone.utc)
-        if next_poll_at and next_poll_at > now:
-            sleep_for = max(0.0, (next_poll_at - now).total_seconds())
-            if sleep_for:
-                time.sleep(sleep_for)
-            now = datetime.now(timezone.utc)
-
-        state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
-        readings = fetch_gauge_data()
-        if not readings:
-            time.sleep(min(args.max_retry_seconds, retry_wait))
-            retry_wait = min(args.max_retry_seconds, retry_wait * 2)
-            next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=retry_wait)
-            state["meta"]["last_failure_at"] = datetime.now(timezone.utc).isoformat()
-            state["meta"]["next_poll_at"] = next_poll_at.isoformat()
+    try:
+        with state_lock(state_path):
+            state = load_state(state_path)
+            maybe_backfill_state(state, args.backfill_hours)
             save_state(state_path, state)
-            continue
+            retry_wait = args.min_retry_seconds
+            next_poll_at: datetime | None = None
 
-        retry_wait = args.min_retry_seconds
-        updates = update_state_with_readings(state, readings, poll_ts=now)
-        maybe_refresh_forecasts(state, args)
-        save_state(state_path, state)
+            while True:
+                now = datetime.now(timezone.utc)
+                if next_poll_at and next_poll_at > now:
+                    sleep_for = max(0.0, (next_poll_at - now).total_seconds())
+                    if sleep_for:
+                        time.sleep(sleep_for)
+                    now = datetime.now(timezone.utc)
 
-        if next_poll_at is None or any(updates.values()):
-            render_table(readings, state)
-        else:
-            # We were early; gently widen the interval and try again soon.
-            for g_state in state.get("gauges", {}).values():
-                if "mean_interval_sec" in g_state:
-                    g_state["mean_interval_sec"] *= 1.05
-            save_state(state_path, state)
-            next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=args.min_retry_seconds)
-            continue
+                state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
+                readings = fetch_gauge_data()
+                if not readings:
+                    time.sleep(min(args.max_retry_seconds, retry_wait))
+                    retry_wait = min(args.max_retry_seconds, retry_wait * 2)
+                    next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=retry_wait)
+                    state["meta"]["last_failure_at"] = datetime.now(timezone.utc).isoformat()
+                    state["meta"]["next_poll_at"] = next_poll_at.isoformat()
+                    save_state(state_path, state)
+                    continue
 
-        now = datetime.now(timezone.utc)
-        next_poll_at = schedule_next_poll(
-            state,
-            now,
-            args.min_retry_seconds,
-        )
-        state["meta"]["last_success_at"] = now.isoformat()
-        state["meta"]["next_poll_at"] = next_poll_at.isoformat()
-        save_state(state_path, state)
+                retry_wait = args.min_retry_seconds
+                updates = update_state_with_readings(state, readings, poll_ts=now)
+                maybe_refresh_forecasts(state, args)
+                save_state(state_path, state)
+
+                if next_poll_at is None or any(updates.values()):
+                    render_table(readings, state)
+                else:
+                    # We were early; gently widen the interval and try again soon.
+                    for g_state in state.get("gauges", {}).values():
+                        if "mean_interval_sec" in g_state:
+                            g_state["mean_interval_sec"] *= 1.05
+                    save_state(state_path, state)
+                    next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=args.min_retry_seconds)
+                    continue
+
+                now = datetime.now(timezone.utc)
+                next_poll_at = schedule_next_poll(
+                    state,
+                    now,
+                    args.min_retry_seconds,
+                )
+                state["meta"]["last_success_at"] = now.isoformat()
+                state["meta"]["next_poll_at"] = next_poll_at.isoformat()
+                save_state(state_path, state)
+    except StateLockError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -2028,20 +2118,25 @@ def main(argv: list[str] | None = None) -> int:
         return adaptive_loop(args) or 0
 
     state_path = Path(args.state_file)
-    state = load_state(state_path)
-    maybe_backfill_state(state, args.backfill_hours)
-    save_state(state_path, state)
+    try:
+        with state_lock(state_path):
+            state = load_state(state_path)
+            maybe_backfill_state(state, args.backfill_hours)
+            save_state(state_path, state)
 
-    data = fetch_gauge_data()
-    if not data:
-        print("No data available from USGS Instantaneous Values service.", file=sys.stderr)
+            data = fetch_gauge_data()
+            if not data:
+                print("No data available from USGS Instantaneous Values service.", file=sys.stderr)
+                return 1
+
+            update_state_with_readings(state, data, poll_ts=datetime.now(timezone.utc))
+            maybe_refresh_forecasts(state, args)
+            maybe_refresh_nwrfc(state, args)
+            save_state(state_path, state)
+            render_table(data, state)
+    except StateLockError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
-
-    update_state_with_readings(state, data, poll_ts=datetime.now(timezone.utc))
-    maybe_refresh_forecasts(state, args)
-    maybe_refresh_nwrfc(state, args)
-    save_state(state_path, state)
-    render_table(data, state)
 
     return 0
 

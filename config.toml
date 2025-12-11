@@ -1,8 +1,14 @@
 # Global configuration for streamvis.
 #
-# This file is not yet wired into the runtime, but is designed to be
-# auto-populated (or hand-edited) with authoritative metadata for each
-# station, especially NOAA / NWPS forecast identifiers and endpoints.
+# This file *is* wired into the runtime:
+#   - Station bindings (`[stations.*].usgs_site_no`) populate SITE_MAP.
+#   - `[global.usgs].iv_base_url` overrides the USGS IV base URL.
+#   - Forecast URL templates come from `--forecast-base`, per-station
+#     `forecast_endpoint`, or `[global.noaa_nwps].default_forecast_template`.
+#
+# Other fields (display_name, nws_lid, fast_changes, etc.) are currently
+# advisory / future-facing; keep them up to date so we can wire them in
+# without drift.
 
 [global.usgs]
 # Primary observed-data source (ground truth).

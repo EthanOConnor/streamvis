@@ -51,7 +51,7 @@ Behavior:
 - Fetches once immediately, then learns the typical update cadence per gauge (EWMA of observed intervals) starting from an 8-minute baseline.
 - Schedules the next multi-gauge request just before the next expected update (shared single call for all gauges).
 - If the prediction was early (no new timestamps), it widens the interval slightly and does a short retry (default 60s) so it converges toward ~1 call per new update.
-- Persisted state lives at `~/.streamvis_state.json` (override with `--state-file PATH`). Only the last timestamps, learned intervals, and last values are stored—no heavy history.
+- Persisted state lives at `~/.streamvis_state.json` (override with `--state-file PATH`). Only the last timestamps, learned intervals, and last values are stored—no heavy history. A single-writer lock prevents two `streamvis` instances from using the same state file concurrently; start a second instance with a different `--state-file` if needed.
 - Learning has sensible floors/ceilings: sub-60-second deltas are ignored when learning cadence, and learned intervals are clamped to a reasonable range before scheduling the next fetch.
 
 Latency-aware scheduling:

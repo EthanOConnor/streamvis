@@ -105,3 +105,10 @@
 - Hardened the Pyodide browser harness by letting `web/main.js` try both local and parent module paths; clarified GitHub Pages hosting layouts in `README.md`.
 - Added stdlib regression tests for scheduler and cadence snap‑up behavior in `tests/test_scheduler.py`.
 - Adjusted `http_client.py` to lazy-import `requests` so offline/unit-test environments can import `streamvis` without the dependency installed.
+
+## 2025-12-11 – P2 config and robustness cleanup
+
+- Updated `config.toml` header to reflect live runtime wiring and marked unused fields as advisory.
+- Added `EDGW1` to built-in defaults so primary gauge ordering is consistent out of the box.
+- Implemented a best-effort single-writer lock for state files using `fcntl` and documented it in README.
+- Preserved last non-None stage/flow on partial USGS reads and added numeric-string coercion for forecast parsing.

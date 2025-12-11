@@ -106,14 +106,14 @@ def _measure_terminal() -> Tuple[int, int]:
         char_width = max(font_size_px * 0.55, 6.0)
 
         rect = el.getBoundingClientRect()
-        width = max(rect.width, 480.0)
+        width = max(rect.width, 320.0)
         height = max(rect.height, 320.0)
 
         cols = int(width // char_width)
         rows = int(height // row_height)
 
-        cols = max(60, min(cols, 200))
-        rows = max(24, min(rows, 60))
+        cols = max(40, min(cols, 200))
+        rows = max(20, min(rows, 60))
         return rows, cols
     except Exception:
         return 40, 120

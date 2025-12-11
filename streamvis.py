@@ -20,6 +20,8 @@ except Exception:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 STATE_FILE_DEFAULT = Path.home() / ".streamvis_state.json"
+# Increment when the on-disk state schema changes in a backward-incompatible way.
+STATE_SCHEMA_VERSION = 1
 # Start with a conservative 8-minute cadence and only speed up if
 # the data clearly updates more frequently.
 DEFAULT_INTERVAL_SEC = 8 * 60
@@ -446,12 +448,22 @@ def load_state(state_path: Path) -> Dict[str, Any]:
         state = {"gauges": {}, "meta": {}}
     state.setdefault("gauges", {})
     state.setdefault("meta", {})
+    meta = state.get("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+        state["meta"] = meta
+    version = meta.get("state_version")
+    if not isinstance(version, int) or version <= 0:
+        meta["state_version"] = STATE_SCHEMA_VERSION
     _cleanup_state(state)
     return state
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
+    meta = state.setdefault("meta", {})
+    if isinstance(meta, dict):
+        meta.setdefault("state_version", STATE_SCHEMA_VERSION)
     tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2, sort_keys=True)
@@ -1493,6 +1505,46 @@ def schedule_next_poll(
     return best_time
 
 
+def control_summary(state: Dict[str, Any], now: datetime) -> str:
+    """
+    Build a concise per-gauge control summary for debugging/tuning.
+    """
+    gauges_state = state.get("gauges", {})
+    if not isinstance(gauges_state, dict):
+        return ""
+    parts: List[str] = []
+    for gauge_id in ordered_gauges():
+        g_state = gauges_state.get(gauge_id, {})
+        if not isinstance(g_state, dict):
+            continue
+        mean_interval = g_state.get("mean_interval_sec")
+        last_ts = _parse_timestamp(g_state.get("last_timestamp"))
+        next_api = predict_gauge_next(state, gauge_id, now)
+        latency_med = g_state.get("latency_median_sec")
+        latency_mad = g_state.get("latency_mad_sec")
+        polls_ewma = g_state.get("polls_per_update_ewma")
+        fine = (
+            isinstance(latency_mad, (int, float))
+            and latency_mad > 0
+            and latency_mad <= FINE_LATENCY_MAD_MAX_SEC
+            and isinstance(mean_interval, (int, float))
+            and mean_interval <= 3600
+        )
+        mi_str = f"{int(mean_interval)}s" if isinstance(mean_interval, (int, float)) else "--"
+        lat_str = (
+            f"{int(latency_med)}±{int(latency_mad)}s"
+            if isinstance(latency_med, (int, float)) and isinstance(latency_mad, (int, float))
+            else "--"
+        )
+        next_str = _fmt_rel(now, next_api) if next_api else "unknown"
+        polls_str = f"{polls_ewma:.2f}" if isinstance(polls_ewma, (int, float)) else "--"
+        last_str = last_ts.isoformat() if last_ts else "--"
+        parts.append(
+            f"{gauge_id}: mean {mi_str} last {last_str} next {next_str} lat {lat_str} fine {fine} calls/upd {polls_str}"
+        )
+    return " | ".join(parts)
+
+
 def _history_values(state: Dict[str, Any], gauge_id: str, metric: str, limit: int = HISTORY_LIMIT) -> List[float]:
     gauges_state = state.get("gauges", {})
     g_state = gauges_state.get(gauge_id, {})
@@ -1610,14 +1662,41 @@ def draw_screen(
     stdscr.addstr(0, 0, title[:max_x - 1], curses_mod.A_BOLD | palette.get("title", 0))
     stdscr.addstr(1, 0, clock_line[:max_x - 1], palette.get("normal", 0))
 
-    header = (
-        f"{'Gauge':<6} "
-        f"{'Stage(ft)':>9} "
-        f"{'Flow(cfs)':>10} "
-        f"{'Status':<11} "
-        f"{'Observed':>9} "
-        f"{'Next ETA':>9}"
-    )
+    wide = max_x >= 60
+    medium = max_x >= 49
+    narrow = max_x >= 39
+
+    if wide:
+        header = (
+            f"{'Gauge':<6} "
+            f"{'Stage(ft)':>9} "
+            f"{'Flow(cfs)':>10} "
+            f"{'Status':<11} "
+            f"{'Observed':>9} "
+            f"{'Next ETA':>9}"
+        )
+    elif medium:
+        header = (
+            f"{'Gauge':<6} "
+            f"{'Stage(ft)':>9} "
+            f"{'Flow(cfs)':>10} "
+            f"{'Status':<11} "
+            f"{'Observed':>9}"
+        )
+    elif narrow:
+        header = (
+            f"{'Gauge':<6} "
+            f"{'Stage(ft)':>9} "
+            f"{'Flow(cfs)':>10} "
+            f"{'Status':<11}"
+        )
+    else:
+        header = (
+            f"{'Gauge':<6} "
+            f"{'Stage(ft)':>9} "
+            f"{'Flow(cfs)':>10}"
+        )
+
     stdscr.addstr(table_start, 0, header[:max_x - 1], curses_mod.A_UNDERLINE | palette.get("normal", 0))
 
     for row, gauge_id in enumerate(gauges, start=table_start + 1):
@@ -1638,14 +1717,36 @@ def draw_screen(
         obs_str = _fmt_clock(observed_at)
         next_str = _fmt_rel(now, next_eta) if next_eta and next_eta >= now else "now"
 
-        line = (
-            f"{gauge_id:<6s} "
-            f"{stage_str:>9s} "
-            f"{flow_str:>10s} "
-            f"{status:<11s} "
-            f"{obs_str:>9s} "
-            f"{next_str:>9s}"
-        )
+        if wide:
+            line = (
+                f"{gauge_id:<6s} "
+                f"{stage_str:>9s} "
+                f"{flow_str:>10s} "
+                f"{status:<11s} "
+                f"{obs_str:>9s} "
+                f"{next_str:>9s}"
+            )
+        elif medium:
+            line = (
+                f"{gauge_id:<6s} "
+                f"{stage_str:>9s} "
+                f"{flow_str:>10s} "
+                f"{status:<11s} "
+                f"{obs_str:>9s}"
+            )
+        elif narrow:
+            line = (
+                f"{gauge_id:<6s} "
+                f"{stage_str:>9s} "
+                f"{flow_str:>10s} "
+                f"{status:<11s}"
+            )
+        else:
+            line = (
+                f"{gauge_id:<6s} "
+                f"{stage_str:>9s} "
+                f"{flow_str:>10s}"
+            )
         color = color_for_status(status, palette)
 
         if gauge_id == gauges[selected_idx]:
@@ -1865,6 +1966,33 @@ def draw_screen(
     stdscr.refresh()
 
 
+def handle_row_click(
+    target_idx: int,
+    selected_idx: int,
+    detail_mode: bool,
+    gauges: List[str],
+) -> tuple[int, bool, str]:
+    """
+    Handle a tap/click on a gauge row.
+
+    UX rule (mobile-friendly):
+    - Tap a new row: select it, but only enter detail mode if we were already
+      viewing details.
+    - Tap the selected row: toggle detail mode.
+    """
+    if target_idx == selected_idx:
+        detail_mode = not detail_mode
+        status_msg = f"{gauges[selected_idx]} details {'on' if detail_mode else 'off'}"
+        return selected_idx, detail_mode, status_msg
+
+    selected_idx = target_idx
+    if detail_mode:
+        status_msg = f"Selected {gauges[selected_idx]} (details)"
+    else:
+        status_msg = f"Selected {gauges[selected_idx]} (tap again for details)"
+    return selected_idx, detail_mode, status_msg
+
+
 def tui_loop(args: argparse.Namespace) -> int:
     try:
         import curses
@@ -1987,14 +2115,9 @@ def tui_loop(args: argparse.Namespace) -> int:
                 first_gauge_row = TUI_TABLE_START + 1
                 target = clicked_row - first_gauge_row
                 if 0 <= target < len(gauges):
-                    if target == selected_idx:
-                        # Toggle detail for the currently selected gauge.
-                        detail_mode = not detail_mode
-                    else:
-                        # Select a new gauge and show its detail view.
-                        selected_idx = target
-                        detail_mode = True
-                    status_msg = f"Selected {gauges[selected_idx]} (tap/click to toggle detail)"
+                    selected_idx, detail_mode, status_msg = handle_row_click(
+                        target, selected_idx, detail_mode, gauges
+                    )
                 continue
 
             if key in (curses.KEY_UP, ord("k")):
@@ -2150,12 +2273,9 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                     first_gauge_row = TUI_TABLE_START + 1
                     target = clicked_row - first_gauge_row
                     if 0 <= target < len(gauges):
-                        if target == selected_idx:
-                            detail_mode = not detail_mode
-                        else:
-                            selected_idx = target
-                            detail_mode = True
-                        status_msg = f"Selected {gauges[selected_idx]} (tap/click to toggle detail)"
+                        selected_idx, detail_mode, status_msg = handle_row_click(
+                            target, selected_idx, detail_mode, gauges
+                        )
                     await asyncio.sleep(0)
                     continue
 
@@ -2238,6 +2358,11 @@ def adaptive_loop(args: argparse.Namespace) -> int:
                 state["meta"]["last_success_at"] = now.isoformat()
                 state["meta"]["next_poll_at"] = next_poll_at.isoformat()
                 save_state(state_path, state)
+                if getattr(args, "debug", False):
+                    try:
+                        print(control_summary(state, now), file=sys.stderr)
+                    except Exception:
+                        pass
     except StateLockError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -2255,6 +2380,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--state-file",
         default=str(STATE_FILE_DEFAULT),
         help="Path to persist observed update cadence and last timestamps.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Emit scheduler/control debug summaries to stderr.",
     )
     parser.add_argument(
         "--min-retry-seconds",
@@ -2344,6 +2474,11 @@ def main(argv: list[str] | None = None) -> int:
             maybe_refresh_forecasts(state, args)
             maybe_refresh_nwrfc(state, args)
             save_state(state_path, state)
+            if getattr(args, "debug", False):
+                try:
+                    print(control_summary(state, datetime.now(timezone.utc)), file=sys.stderr)
+                except Exception:
+                    pass
             render_table(data, state)
     except StateLockError as exc:
         print(str(exc), file=sys.stderr)

@@ -93,9 +93,25 @@
   - Trade‑off: if a truly slow gauge suddenly accelerates its cadence, detection may lag until the next coarse poll; this is accepted in favor of politeness and can be revisited per‑station if needed.
 
 - **Calls‑per‑update instrumentation**:
-  - We persist `no_update_polls` per gauge to count consecutive polls with no new timestamp.
-  - On a real update, we record `last_polls_per_update = no_update_polls + 1` and update `polls_per_update_ewma` using the standard EWMA alpha.
+- We persist `no_update_polls` per gauge to count consecutive polls with no new timestamp.
+- On a real update, we record `last_polls_per_update = no_update_polls + 1` and update `polls_per_update_ewma` using the standard EWMA alpha.
 - Expanded TUI detail surfaces both values so we can tune scheduler constants without extra dependencies or heavy logging.
+
+## 2025-12-11 – Upstream API / dependency updates (mid‑Dec 2025 check)
+
+- **USGS WaterServices NWIS IV**:
+  - As of an August 5, 2024 backend update, USGS discontinued WaterML2 and RDB output for some WaterServices endpoints; IV and groundwater services still support JSON and WaterML 1.1, and JSON remains the recommended low‑latency format.
+  - The IV service continues to accept batched multi‑site JSON requests (current usage is compatible).
+  - IV supports a `modifiedSince` query parameter so clients can request only updates since a timestamp, potentially reducing bandwidth for early/no‑update polls.
+  - USGS is rolling out modernized Water Data for the Nation APIs using OGC API‑Features; WaterServices will remain for now but a future migration path is expected.
+
+- **NOAA National Water Prediction Service (NWPS)**:
+  - NWPS replaced legacy AHPS in 2024 and provides official forecast/observation APIs under `api.water.noaa.gov/nwps/v1` with published JSON shapes.
+  - NWPS also exposes an experimental HEFS‑driven probabilistic forecast API family, which may be a future overlay source.
+
+- **Pyodide / browser runtime**:
+  - Pyodide 0.29.x is the current stable line (late‑2025) and the CDN path we use is valid.
+  - Recent Pyodide guidance emphasizes async/JSPI‑friendly execution and keeping `fullStdLib` off by default to reduce load; our async web TUI driver aligns with this.
 
 ## 2025-12-11 – State locking and partial-value policy
 

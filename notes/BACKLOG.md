@@ -11,6 +11,10 @@
 - Web UI polish:
   - Tune browser color palette for readability (esp. iOS OLED contrast).
   - Add an optional light/dark theme toggle without new deps.
+- Upstream API optimization:
+  - Explore using USGS IV `modifiedSince` to skip parsing/no‑update payloads during early polls.
+  - Track USGS OGC API‑Features rollout and plan a migration path if WaterServices IV is deprecated.
+  - Evaluate NWPS HEFS probabilistic endpoints for optional future forecast overlays.
 
 ## Medium-term
 

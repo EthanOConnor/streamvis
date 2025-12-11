@@ -294,9 +294,9 @@ Design vs implementation:
 
 **P3 – Nice‑to‑have**
 
-- Hoist some nested TUI helpers to top level (esp. for future async web driver).
-- Optional debug/control summary logging for cadence/latency tuning.
-- Add a simple state schema version for forward compatibility.
+- Hoist some nested TUI helpers to top level (resolved 2025‑12‑11; shared `draw_screen`/`color_for_status`).
+- Optional debug/control summary logging for cadence/latency tuning (resolved 2025‑12‑11; `--debug` + `control_summary`).
+- Add a simple state schema version for forward compatibility (resolved 2025‑12‑11; `meta.state_version`).
 
 ## 2025-12-11 – Pyodide/iOS responsiveness risk
 

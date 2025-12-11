@@ -124,3 +124,14 @@
 - Refactored TUI rendering helpers (`color_for_status`, `draw_screen`) to top-level so both native and web drivers share layout/formatting.
 - Added an async `web_tui_main` that yields via `asyncio.sleep` to keep mobile Safari responsive; browser entrypoint now uses it.
 - Added a fixed loading bar with fake progress and step text in `web/main.js` + `web/index.html` to show Pyodide startup progress and avoid “black screen” confusion on slow loads.
+
+## 2025-12-11 – Upstream check + P3 cleanup
+
+- Performed an up-to-date (mid‑Dec 2025) review of USGS WaterServices, NOAA NWPS, and Pyodide changes; captured impacts and follow-ups in `notes/MEMORY.md` and `notes/BACKLOG.md`.
+- Added a state schema version (`meta.state_version`) and optional `--debug` control-summary logging for cadence/latency tuning.
+
+## 2025-12-11 – P4 mobile/table UX polish
+
+- Improved mobile tap targeting by accounting for scroll and padding in the JS click mapper; guarded against double-firing pointer/click events.
+- Adjusted tap UX so first tap selects a row and a second tap opens/closes details; switching rows in list view no longer auto-enters detail mode.
+- Made browser terminal sizing truly responsive (reduced hard minimum columns) and added adaptive table columns in `draw_screen` to avoid right-edge overflow on iOS.

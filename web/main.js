@@ -46,28 +46,37 @@ document.addEventListener("keydown", (ev) => {
   }
 });
 
-term.addEventListener("click", (ev) => {
+function handleRowClick(ev) {
   const rect = term.getBoundingClientRect();
-  const y = ev.clientY - rect.top;
-  if (y < 0) return;
-
   const style = getComputedStyle(term);
   const fontSizePx = parseFloat(style.fontSize || "13") || 13;
   const lineHeightRaw = style.lineHeight;
   let lineHeightPx;
   if (lineHeightRaw.endsWith("px")) {
-    lineHeightPx = parseFloat(lineHeightRaw.replace("px", "")) || fontSizePx * 1.1;
+    lineHeightPx = parseFloat(lineHeightRaw.replace("px", "")) || fontSizePx * 1.2;
   } else if (lineHeightRaw && lineHeightRaw !== "normal") {
     lineHeightPx = parseFloat(lineHeightRaw) * fontSizePx;
   } else {
-    lineHeightPx = fontSizePx * 1.1;
+    lineHeightPx = fontSizePx * 1.2;
   }
 
+  const paddingTopPx = parseFloat(style.paddingTop || "0") || 0;
+  const y = ev.clientY - rect.top + term.scrollTop - paddingTopPx;
+  if (y < 0) return;
+
   const row = Math.floor(y / lineHeightPx);
-  // Encode "click row N" as a synthetic key code; Python maps row indices
-  // to gauge rows based on its layout (table_start + 1, etc.).
   const code = 3000 + row;
   window.streamvisKeyQueue.push(code);
+}
+
+let lastPointerTs = 0;
+term.addEventListener("pointerup", (ev) => {
+  lastPointerTs = performance.now();
+  handleRowClick(ev);
+});
+term.addEventListener("click", (ev) => {
+  if (performance.now() - lastPointerTs < 500) return;
+  handleRowClick(ev);
 });
 
 async function loadPythonModule(pyodide, path) {

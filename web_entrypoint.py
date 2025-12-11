@@ -11,7 +11,7 @@ argument list suitable for running the TUI in a web "terminal".
 
 from typing import List
 
-from streamvis import main
+from streamvis import main, web_tui_main
 
 
 def run_default() -> int:
@@ -30,6 +30,23 @@ def run_default() -> int:
         "0.25",
     ]
     return main(argv)
+
+
+async def run_default_async() -> int:
+    """
+    Async browser entrypoint that yields to the JS event loop.
+    """
+    argv: List[str] = [
+        "--mode",
+        "tui",
+        "--state-file",
+        "streamvis_state.json",
+        "--backfill-hours",
+        "12",
+        "--ui-tick-sec",
+        "0.25",
+    ]
+    return await web_tui_main(argv)
 
 
 def run_with_args(arg_list: List[str]) -> int:

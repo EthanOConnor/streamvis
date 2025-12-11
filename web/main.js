@@ -1,9 +1,23 @@
 import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v0.29.0/full/pyodide.mjs";
 
 const term = document.getElementById("terminal");
+const loadingEl = document.getElementById("loading");
+const loadingTextEl = document.getElementById("loading-text");
+const loadingProgressEl = document.getElementById("loading-progress");
 
 // Global key queue consumed by web_curses.getch().
 window.streamvisKeyQueue = [];
+
+function setLoading(text, value) {
+  if (loadingTextEl) loadingTextEl.textContent = text;
+  if (loadingProgressEl) {
+    if (typeof value === "number") {
+      loadingProgressEl.value = value;
+    } else {
+      loadingProgressEl.removeAttribute("value");
+    }
+  }
+}
 
 function mapKey(ev) {
   if (ev.key.length === 1) {
@@ -117,35 +131,49 @@ async function syncStateToLocalStorage(pyodide) {
 
 async function main() {
   term.textContent = "Loading Pyodide…";
+  setLoading("Loading Pyodide runtime…", 0);
+
+  // Simple fake progress while the large runtime downloads/initializes.
+  let fake = 0;
+  const timer = setInterval(() => {
+    fake = Math.min(fake + 1, 80);
+    if (loadingProgressEl) loadingProgressEl.value = fake;
+  }, 200);
 
   const pyodide = await loadPyodide({
     indexURL: "https://cdn.jsdelivr.net/pyodide/v0.29.0/full/",
   });
 
+  clearInterval(timer);
+  setLoading("Initializing filesystem…", 85);
   await syncStateFromLocalStorage(pyodide);
 
   // Load Python modules needed for the browser build.
+  setLoading("Loading streamvis modules…", 90);
   await loadPythonModule(pyodide, "../http_client.py");
   await loadPythonModule(pyodide, "../web_curses.py");
   await loadPythonModule(pyodide, "../streamvis.py");
   await loadPythonModule(pyodide, "../web_entrypoint.py");
 
   // Patch curses to point at the web_curses shim.
+  setLoading("Starting TUI…", 97);
   await pyodide.runPythonAsync(`
 import sys, web_curses
 sys.modules["curses"] = web_curses
   `);
 
   term.textContent = "Starting streamvis… (press q to quit)";
+  if (loadingEl) loadingEl.classList.add("hidden");
 
   try {
     await pyodide.runPythonAsync(`
-from web_entrypoint import run_default
-run_default()
+from web_entrypoint import run_default_async
+await run_default_async()
     `);
   } catch (err) {
     console.error(err);
     term.textContent = "Error running streamvis:\\n" + err;
+    setLoading("Error starting streamvis (see console).", 100);
     return;
   }
 
@@ -155,4 +183,5 @@ run_default()
 main().catch((err) => {
   console.error(err);
   term.textContent = "Error initialising streamvis:\\n" + err;
+  setLoading("Error initializing Pyodide (see console).", 100);
 });

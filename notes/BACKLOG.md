@@ -8,6 +8,9 @@
   - Amplitude bias (actual vs forecast).
   - Phase shift / peak timing differences.
   - Simple adjusted “expected peak” using a lightweight online regression model.
+- Web UI polish:
+  - Tune browser color palette for readability (esp. iOS OLED contrast).
+  - Add an optional light/dark theme toggle without new deps.
 
 ## Medium-term
 

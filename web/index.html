@@ -15,11 +15,30 @@
         padding: 0;
         font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
       }
+      #loading {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: #000;
+        color: #0f0;
+        padding: 8px;
+        font-size: 14px;
+        z-index: 10;
+        border-bottom: 1px solid #030;
+      }
+      #loading-progress {
+        width: 100%;
+        height: 6px;
+      }
+      #loading.hidden {
+        display: none;
+      }
       #terminal {
         white-space: pre;
         line-height: 1.2;
         font-size: clamp(12px, 1.8vw, 16px);
-        padding: 8px 8px calc(8px + env(safe-area-inset-bottom));
+        padding: calc(8px + 40px) 8px calc(8px + env(safe-area-inset-bottom));
         height: 100vh;
         overflow: auto;
         user-select: none;
@@ -28,6 +47,10 @@
     </style>
   </head>
   <body>
+    <div id="loading">
+      <div id="loading-text">Loading Pyodide…</div>
+      <progress id="loading-progress" max="100" value="0"></progress>
+    </div>
     <div id="terminal">Loading streamvis…</div>
     <script type="module" src="./main.js"></script>
   </body>

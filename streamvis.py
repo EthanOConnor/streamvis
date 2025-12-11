@@ -1567,6 +1567,304 @@ def render_table(readings: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> 
         )
 
 
+def color_for_status(status: str, palette: Dict[str, int]) -> int:
+    status = (status or "").upper()
+    if "MAJOR" in status:
+        return palette.get("major", 0)
+    if "MOD" in status:
+        return palette.get("moderate", 0)
+    if "MINOR" in status:
+        return palette.get("minor", 0)
+    if "ACTION" in status:
+        return palette.get("action", 0)
+    return palette.get("normal", 0)
+
+
+def draw_screen(
+    stdscr: Any,
+    curses_mod: Any,
+    gauges: List[str],
+    readings: Dict[str, Dict[str, Any]],
+    state: Dict[str, Any],
+    selected_idx: int,
+    chart_metric: str,
+    status_msg: str,
+    next_poll_at: datetime | None,
+    palette: Dict[str, int],
+    detail_mode: bool,
+    table_start: int,
+    state_file: str,
+    update_alert: bool,
+) -> None:
+    stdscr.erase()
+    max_y, max_x = stdscr.getmaxyx()
+    now = datetime.now(timezone.utc)
+    local_now = datetime.now().astimezone()
+
+    title = "STREAMVIS // SNOQUALMIE WATCH"
+    clock_line = (
+        f"Now {local_now.strftime('%Y-%m-%d %H:%M:%S %Z')} | "
+        f"{now.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    )
+
+    stdscr.addstr(0, 0, title[:max_x - 1], curses_mod.A_BOLD | palette.get("title", 0))
+    stdscr.addstr(1, 0, clock_line[:max_x - 1], palette.get("normal", 0))
+
+    header = (
+        f"{'Gauge':<6} "
+        f"{'Stage(ft)':>9} "
+        f"{'Flow(cfs)':>10} "
+        f"{'Status':<11} "
+        f"{'Observed':>9} "
+        f"{'Next ETA':>9}"
+    )
+    stdscr.addstr(table_start, 0, header[:max_x - 1], curses_mod.A_UNDERLINE | palette.get("normal", 0))
+
+    for row, gauge_id in enumerate(gauges, start=table_start + 1):
+        if row >= max_y - 5:
+            break  # leave space for detail + footer
+
+        reading = readings.get(gauge_id, {})
+        status = reading.get("status", "UNKNOWN")
+        stage = reading.get("stage")
+        flow = reading.get("flow")
+        observed_at = reading.get("observed_at") or _parse_timestamp(
+            state.get("gauges", {}).get(gauge_id, {}).get("last_timestamp")
+        )
+        next_eta = predict_gauge_next(state, gauge_id, now)
+
+        stage_str = f"{stage:.2f}" if isinstance(stage, (int, float)) else "--"
+        flow_str = f"{int(flow):d}" if isinstance(flow, (int, float)) else "--"
+        obs_str = _fmt_clock(observed_at)
+        next_str = _fmt_rel(now, next_eta) if next_eta and next_eta >= now else "now"
+
+        line = (
+            f"{gauge_id:<6s} "
+            f"{stage_str:>9s} "
+            f"{flow_str:>10s} "
+            f"{status:<11s} "
+            f"{obs_str:>9s} "
+            f"{next_str:>9s}"
+        )
+        color = color_for_status(status, palette)
+
+        if gauge_id == gauges[selected_idx]:
+            stdscr.addstr(row, 0, line[:max_x - 1], curses_mod.A_REVERSE | color)
+        else:
+            stdscr.addstr(row, 0, line[:max_x - 1], color)
+
+    detail_y = row + 2 if "row" in locals() else table_start + len(gauges) + 2
+    if detail_y < max_y - 2:
+        selected = gauges[selected_idx]
+        g_state = state.get("gauges", {}).get(selected, {})
+        reading = readings.get(selected, {})
+        observed_at = reading.get("observed_at") or _parse_timestamp(g_state.get("last_timestamp"))
+        next_eta = predict_gauge_next(state, selected, now)
+        stage = reading.get("stage")
+        flow = reading.get("flow")
+        detail = (
+            f"{selected} | Stage: {stage if stage is not None else '-'} ft | "
+            f"Flow: {int(flow) if isinstance(flow, (int, float)) else '-'} cfs | "
+            f"Status: {reading.get('status', 'UNKNOWN')}"
+        )
+        timing = (
+            f"Observed {_fmt_clock(observed_at, with_date=False)} ({_fmt_rel(now, observed_at)}), "
+            f"Next ETA: {_fmt_rel(now, next_eta) if next_eta and next_eta >= now else 'now'}"
+        )
+        stdscr.addstr(detail_y, 0, detail[:max_x - 1], palette.get("normal", 0) | curses_mod.A_BOLD)
+        stdscr.addstr(detail_y + 1, 0, timing[:max_x - 1], palette.get("normal", 0))
+
+        if detail_mode:
+            # Expanded detail: table of recent updates with per-update deltas.
+            history = g_state.get("history", []) or []
+            recent = history[-6:]
+            table_y = detail_y + 3
+            if table_y < max_y - 2:
+                header_line = (
+                    f"{'Time':>8}  "
+                    f"{'Stage':>8} "
+                    f"{'ΔStage':>8} "
+                    f"{'Flow':>8} "
+                    f"{'ΔFlow':>8}"
+                )
+                stdscr.addstr(table_y, 0, header_line[:max_x - 1], palette.get("dim", 0))
+                prev_stage = None
+                prev_flow = None
+                row_y = table_y + 1
+                for entry in recent:
+                    if row_y >= max_y - 3:
+                        break
+                    ts_raw = entry.get("ts")
+                    ts_dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+                    ts_str = _fmt_clock(ts_dt, with_date=False)
+                    stage_v = entry.get("stage")
+                    flow_v = entry.get("flow")
+                    ds = (
+                        stage_v - prev_stage
+                        if isinstance(stage_v, (int, float)) and isinstance(prev_stage, (int, float))
+                        else None
+                    )
+                    df = (
+                        flow_v - prev_flow
+                        if isinstance(flow_v, (int, float)) and isinstance(prev_flow, (int, float))
+                        else None
+                    )
+                    prev_stage = stage_v
+                    prev_flow = flow_v
+                    stage_str = f"{stage_v:8.2f}" if isinstance(stage_v, (int, float)) else "      --"
+                    ds_str = f"{ds:+8.2f}" if isinstance(ds, (int, float)) else "      --"
+                    flow_str = f"{int(flow_v):8d}" if isinstance(flow_v, (int, float)) else "      --"
+                    df_str = f"{int(df):+8d}" if isinstance(df, (int, float)) else "      --"
+                    line = f"{ts_str:>8s}  {stage_str} {ds_str} {flow_str} {df_str}"
+                    stdscr.addstr(row_y, 0, line[:max_x - 1], palette.get("chart", 0))
+                    row_y += 1
+
+                # Simple trend summary over the recent window.
+                if len(recent) >= 2:
+                    times: List[datetime] = []
+                    stages: List[float] = []
+                    flows: List[float] = []
+                    for entry in recent:
+                        ts_raw = entry.get("ts")
+                        dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+                        if dt is None:
+                            continue
+                        times.append(dt)
+                        s = entry.get("stage")
+                        f = entry.get("flow")
+                        if isinstance(s, (int, float)):
+                            stages.append(float(s))
+                        if isinstance(f, (int, float)):
+                            flows.append(float(f))
+
+                    if len(times) >= 2:
+                        dh_hours = (times[-1] - times[0]).total_seconds() / 3600.0 or 1.0
+                    else:
+                        dh_hours = 1.0
+
+                    if len(stages) >= 2:
+                        stage_trend = (stages[-1] - stages[0]) / dh_hours
+                    else:
+                        stage_trend = 0.0
+
+                    if len(flows) >= 2:
+                        flow_trend = (flows[-1] - flows[0]) / max(dh_hours, 1e-6)
+                    else:
+                        flow_trend = 0.0
+
+                    trend_line = f"Trend: stage {stage_trend:+.2f} ft/h   flow {flow_trend:+.0f} cfs/h"
+                    if row_y < max_y - 2:
+                        stdscr.addstr(row_y, 0, trend_line[:max_x - 1], palette.get("dim", 0))
+                        row_y += 1
+
+                # Latency stats.
+                latency_med = g_state.get("latency_median_sec")
+                latency_mad = g_state.get("latency_mad_sec")
+                if isinstance(latency_med, (int, float)) and row_y < max_y - 2:
+                    lm = int(round(latency_med))
+                    ls = int(round(latency_mad)) if isinstance(latency_mad, (int, float)) else 0
+                    lat_line = f"Latency (obs→API): median {lm}s, MAD {ls}s"
+                    stdscr.addstr(row_y, 0, lat_line[:max_x - 1], palette.get("dim", 0))
+                    row_y += 1
+
+                # Poll efficiency (calls per real update).
+                last_polls = g_state.get("last_polls_per_update")
+                polls_ewma = g_state.get("polls_per_update_ewma")
+                if (
+                    (isinstance(last_polls, (int, float)) or isinstance(polls_ewma, (int, float)))
+                    and row_y < max_y - 2
+                ):
+                    last_str = f"{int(last_polls)}" if isinstance(last_polls, (int, float)) else "--"
+                    ewma_str = f"{float(polls_ewma):.2f}" if isinstance(polls_ewma, (int, float)) else "--"
+                    calls_line = f"Calls/update: last {last_str}  ewma {ewma_str}"
+                    stdscr.addstr(row_y, 0, calls_line[:max_x - 1], palette.get("dim", 0))
+                    row_y += 1
+
+                # NW RFC cross-check (if available).
+                nwrfc_all = state.get("nwrfc", {}).get(selected, {})
+                diff = nwrfc_all.get("diff_vs_usgs") if isinstance(nwrfc_all, dict) else None
+                if diff and row_y < max_y - 2:
+                    sd = diff.get("stage_delta")
+                    qd = diff.get("flow_delta")
+                    sd_str = f"{sd:+.2f} ft" if isinstance(sd, (int, float)) else "n/a"
+                    qd_str = f"{qd:+.0f} cfs" if isinstance(qd, (int, float)) else "n/a"
+                    line = f"NW RFC vs USGS (last): Δstage {sd_str}, Δflow {qd_str}"
+                    stdscr.addstr(row_y, 0, line[:max_x - 1], palette.get("dim", 0))
+                    row_y += 1
+
+                # Forecast summary (if available).
+                forecast_all = state.get("forecast", {}).get(selected, {})
+                summary = forecast_all.get("summary") if isinstance(forecast_all, dict) else None
+                bias = forecast_all.get("bias") if isinstance(forecast_all, dict) else None
+                phase_shift_sec = (
+                    forecast_all.get("phase_shift_sec") if isinstance(forecast_all, dict) else None
+                )
+                if summary and row_y < max_y - 2:
+
+                    def fmt_peak(key: str) -> str:
+                        block = summary.get(key) or {}
+                        s = block.get("stage")
+                        q = block.get("flow")
+                        s_str = f"{s:.2f} ft" if isinstance(s, (int, float)) else "--"
+                        q_str = f"{int(q)} cfs" if isinstance(q, (int, float)) else "--"
+                        return f"{s_str} / {q_str}"
+
+                    line1 = (
+                        f"Forecast peaks (stage/flow): "
+                        f"3h {fmt_peak('max_3h')}  |  24h {fmt_peak('max_24h')}  |  full {fmt_peak('max_full')}"
+                    )
+                    stdscr.addstr(row_y, 0, line1[:max_x - 1], palette.get("dim", 0))
+                    row_y += 1
+
+                    if bias and row_y < max_y - 1:
+                        sd = bias.get("stage_delta")
+                        sr = bias.get("stage_ratio")
+                        qd = bias.get("flow_delta")
+                        qr = bias.get("flow_ratio")
+                        sd_str = f"{sd:+.2f} ft" if isinstance(sd, (int, float)) else "n/a"
+                        sr_str = f"{sr:.2f}×" if isinstance(sr, (int, float)) else "n/a"
+                        qd_str = f"{qd:+.0f} cfs" if isinstance(qd, (int, float)) else "n/a"
+                        qr_str = f"{qr:.2f}×" if isinstance(qr, (int, float)) else "n/a"
+                        line2 = f"Vs forecast now: Δstage {sd_str} ({sr_str}), Δflow {qd_str} ({qr_str})"
+                        stdscr.addstr(row_y, 0, line2[:max_x - 1], palette.get("dim", 0))
+                        row_y += 1
+
+                    if isinstance(phase_shift_sec, (int, float)) and row_y < max_y - 1:
+                        hours = phase_shift_sec / 3600.0
+                        sign = "earlier" if hours < 0 else "later"
+                        line3 = f"Peak timing: {abs(hours):.2f} h {sign} than forecast"
+                        stdscr.addstr(row_y, 0, line3[:max_x - 1], palette.get("dim", 0))
+        else:
+            # Compact detail: sparkline chart and summary stats.
+            chart_vals = _history_values(state, selected, chart_metric)
+            chart_line = _render_sparkline(chart_vals, width=max(10, max_x - 12))
+            chart_label = f"{chart_metric.upper()} history ({len(chart_vals)} pts, newest right)"
+            stdscr.addstr(detail_y + 3, 0, chart_label[:max_x - 1], palette.get("dim", 0))
+            stdscr.addstr(detail_y + 4, 0, chart_line[:max_x - 1], palette.get("chart", 0))
+            if chart_vals:
+                delta = chart_vals[-1] - chart_vals[0]
+                stats = f"{chart_metric}: min {min(chart_vals):.2f}  max {max(chart_vals):.2f}  Δ {delta:+.2f}"
+                stdscr.addstr(detail_y + 5, 0, stats[:max_x - 1], palette.get("dim", 0))
+
+    footer_y = max_y - 2
+    if footer_y >= 0:
+        next_multi = _fmt_rel(now, next_poll_at) if next_poll_at else "pending"
+        footer = (
+            "[↑/↓] select  [Enter] details  [c] toggle chart metric  [b] toggle alert  [r] refresh  [f] force refetch  [q] quit  "
+            f"Next fetch: {next_multi}  |  {status_msg}"
+        )
+        stdscr.addstr(footer_y, 0, footer[:max_x - 1], palette.get("dim", 0))
+
+    info_y = footer_y + 1
+    if 0 <= info_y < max_y:
+        info_line = (
+            f"Mode: TUI adaptive | Alerts: {'on' if update_alert else 'off'} | State: {state_file}"
+        )
+        stdscr.addstr(info_y, 0, info_line[:max_x - 1], palette.get("dim", 0))
+
+    stdscr.refresh()
+
+
 def tui_loop(args: argparse.Namespace) -> int:
     try:
         import curses
@@ -1579,277 +1877,6 @@ def tui_loop(args: argparse.Namespace) -> int:
     # Row index where the table header is drawn; gauge rows start at
     # TUI_TABLE_START + 1. This is shared with the web click/tap mapping.
     TUI_TABLE_START = 3
-
-    def color_for_status(status: str, palette: Dict[str, int]) -> int:
-        status = (status or "").upper()
-        if "MAJOR" in status:
-            return palette.get("major", 0)
-        if "MOD" in status:
-            return palette.get("moderate", 0)
-        if "MINOR" in status:
-            return palette.get("minor", 0)
-        if "ACTION" in status:
-            return palette.get("action", 0)
-        return palette.get("normal", 0)
-
-    def draw_screen(stdscr: Any, readings: Dict[str, Dict[str, Any]], state: Dict[str, Any], selected_idx: int,
-                    chart_metric: str, status_msg: str, next_poll_at: datetime | None, palette: Dict[str, int],
-                    detail_mode: bool) -> None:
-        stdscr.erase()
-        max_y, max_x = stdscr.getmaxyx()
-        now = datetime.now(timezone.utc)
-        local_now = datetime.now().astimezone()
-
-        title = "STREAMVIS // SNOQUALMIE WATCH"
-        clock_line = (
-            f"Now {local_now.strftime('%Y-%m-%d %H:%M:%S %Z')} | "
-            f"{now.strftime('%Y-%m-%d %H:%M:%S')} UTC"
-        )
-
-        stdscr.addstr(0, 0, title[:max_x - 1], curses.A_BOLD | palette.get("title", 0))
-        stdscr.addstr(1, 0, clock_line[:max_x - 1], palette.get("normal", 0))
-
-        table_start = TUI_TABLE_START
-        header = (
-            f"{'Gauge':<6} "
-            f"{'Stage(ft)':>9} "
-            f"{'Flow(cfs)':>10} "
-            f"{'Status':<11} "
-            f"{'Observed':>9} "
-            f"{'Next ETA':>9}"
-        )
-        stdscr.addstr(table_start, 0, header[:max_x - 1], curses.A_UNDERLINE | palette.get("normal", 0))
-
-        for row, gauge_id in enumerate(gauges, start=table_start + 1):
-            if row >= max_y - 5:
-                break  # leave space for detail + footer
-
-            reading = readings.get(gauge_id, {})
-            status = reading.get("status", "UNKNOWN")
-            stage = reading.get("stage")
-            flow = reading.get("flow")
-            observed_at = reading.get("observed_at") or _parse_timestamp(
-                state.get("gauges", {}).get(gauge_id, {}).get("last_timestamp")
-            )
-            next_eta = predict_gauge_next(state, gauge_id, now)
-
-            stage_str = f"{stage:.2f}" if isinstance(stage, (int, float)) else "--"
-            flow_str = f"{int(flow):d}" if isinstance(flow, (int, float)) else "--"
-            obs_str = _fmt_clock(observed_at)
-            next_str = _fmt_rel(now, next_eta) if next_eta and next_eta >= now else "now"
-
-            line = (
-                f"{gauge_id:<6s} "
-                f"{stage_str:>9s} "
-                f"{flow_str:>10s} "
-                f"{status:<11s} "
-                f"{obs_str:>9s} "
-                f"{next_str:>9s}"
-            )
-            color = color_for_status(status, palette)
-
-            if gauge_id == gauges[selected_idx]:
-                stdscr.addstr(row, 0, line[:max_x - 1], curses.A_REVERSE | color)
-            else:
-                stdscr.addstr(row, 0, line[:max_x - 1], color)
-
-        detail_y = row + 2 if 'row' in locals() else table_start + len(gauges) + 2
-        if detail_y < max_y - 2:
-            selected = gauges[selected_idx]
-            g_state = state.get("gauges", {}).get(selected, {})
-            reading = readings.get(selected, {})
-            observed_at = reading.get("observed_at") or _parse_timestamp(g_state.get("last_timestamp"))
-            next_eta = predict_gauge_next(state, selected, now)
-            stage = reading.get("stage")
-            flow = reading.get("flow")
-            detail = (
-                f"{selected} | Stage: {stage if stage is not None else '-'} ft | "
-                f"Flow: {int(flow) if isinstance(flow, (int, float)) else '-'} cfs | "
-                f"Status: {reading.get('status', 'UNKNOWN')}"
-            )
-            timing = (
-                f"Observed {_fmt_clock(observed_at, with_date=False)} ({_fmt_rel(now, observed_at)}), "
-                f"Next ETA: {_fmt_rel(now, next_eta) if next_eta and next_eta >= now else 'now'}"
-            )
-            stdscr.addstr(detail_y, 0, detail[:max_x - 1], palette.get("normal", 0) | curses.A_BOLD)
-            stdscr.addstr(detail_y + 1, 0, timing[:max_x - 1], palette.get("normal", 0))
-
-            if detail_mode:
-                # Expanded detail: table of recent updates with per-update deltas.
-                history = g_state.get("history", []) or []
-                recent = history[-6:]
-                table_y = detail_y + 3
-                if table_y < max_y - 2:
-                    header_line = (
-                        f"{'Time':>8}  "
-                        f"{'Stage':>8} "
-                        f"{'ΔStage':>8} "
-                        f"{'Flow':>8} "
-                        f"{'ΔFlow':>8}"
-                    )
-                    stdscr.addstr(table_y, 0, header_line[:max_x - 1], palette.get("dim", 0))
-                    prev_stage = None
-                    prev_flow = None
-                    row_y = table_y + 1
-                    for entry in recent:
-                        if row_y >= max_y - 3:
-                            break
-                        ts_raw = entry.get("ts")
-                        ts_dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
-                        ts_str = _fmt_clock(ts_dt, with_date=False)
-                        stage_v = entry.get("stage")
-                        flow_v = entry.get("flow")
-                        ds = stage_v - prev_stage if isinstance(stage_v, (int, float)) and isinstance(prev_stage, (int, float)) else None
-                        df = flow_v - prev_flow if isinstance(flow_v, (int, float)) and isinstance(prev_flow, (int, float)) else None
-                        prev_stage = stage_v
-                        prev_flow = flow_v
-                        stage_str = f"{stage_v:8.2f}" if isinstance(stage_v, (int, float)) else "      --"
-                        ds_str = f"{ds:+8.2f}" if isinstance(ds, (int, float)) else "      --"
-                        flow_str = f"{int(flow_v):8d}" if isinstance(flow_v, (int, float)) else "      --"
-                        df_str = f"{int(df):+8d}" if isinstance(df, (int, float)) else "      --"
-                        line = f"{ts_str:>8s}  {stage_str} {ds_str} {flow_str} {df_str}"
-                        stdscr.addstr(row_y, 0, line[:max_x - 1], palette.get("chart", 0))
-                        row_y += 1
-
-                    # Simple trend summary over the recent window.
-                    if len(recent) >= 2:
-                        times: List[datetime] = []
-                        stages: List[float] = []
-                        flows: List[float] = []
-                        for entry in recent:
-                            ts_raw = entry.get("ts")
-                            dt = _parse_timestamp(ts_raw) if isinstance(ts_raw, str) else None
-                            if dt is None:
-                                continue
-                            times.append(dt)
-                            s = entry.get("stage")
-                            f = entry.get("flow")
-                            if isinstance(s, (int, float)):
-                                stages.append(float(s))
-                            if isinstance(f, (int, float)):
-                                flows.append(float(f))
-
-                        if len(times) >= 2:
-                            dh_hours = (times[-1] - times[0]).total_seconds() / 3600.0 or 1.0
-                        else:
-                            dh_hours = 1.0
-
-                        if len(stages) >= 2:
-                            stage_trend = (stages[-1] - stages[0]) / dh_hours
-                        else:
-                            stage_trend = 0.0
-
-                        if len(flows) >= 2:
-                            flow_trend = (flows[-1] - flows[0]) / max(dh_hours, 1e-6)
-                        else:
-                            flow_trend = 0.0
-
-                        trend_line = f"Trend: stage {stage_trend:+.2f} ft/h   flow {flow_trend:+.0f} cfs/h"
-                        if row_y < max_y - 2:
-                            stdscr.addstr(row_y, 0, trend_line[:max_x - 1], palette.get("dim", 0))
-                            row_y += 1
-
-                    # Latency stats.
-                    latency_med = g_state.get("latency_median_sec")
-                    latency_mad = g_state.get("latency_mad_sec")
-                    if isinstance(latency_med, (int, float)) and row_y < max_y - 2:
-                        lm = int(round(latency_med))
-                        ls = int(round(latency_mad)) if isinstance(latency_mad, (int, float)) else 0
-                        lat_line = f"Latency (obs→API): median {lm}s, MAD {ls}s"
-                        stdscr.addstr(row_y, 0, lat_line[:max_x - 1], palette.get("dim", 0))
-                        row_y += 1
-
-                    # Poll efficiency (calls per real update).
-                    last_polls = g_state.get("last_polls_per_update")
-                    polls_ewma = g_state.get("polls_per_update_ewma")
-                    if (
-                        (isinstance(last_polls, (int, float)) or isinstance(polls_ewma, (int, float)))
-                        and row_y < max_y - 2
-                    ):
-                        last_str = f"{int(last_polls)}" if isinstance(last_polls, (int, float)) else "--"
-                        ewma_str = f"{float(polls_ewma):.2f}" if isinstance(polls_ewma, (int, float)) else "--"
-                        calls_line = f"Calls/update: last {last_str}  ewma {ewma_str}"
-                        stdscr.addstr(row_y, 0, calls_line[:max_x - 1], palette.get("dim", 0))
-                        row_y += 1
-
-                    # NW RFC cross-check (if available).
-                    nwrfc_all = state.get("nwrfc", {}).get(selected, {})
-                    diff = nwrfc_all.get("diff_vs_usgs") if isinstance(nwrfc_all, dict) else None
-                    if diff and row_y < max_y - 2:
-                        sd = diff.get("stage_delta")
-                        qd = diff.get("flow_delta")
-                        sd_str = f"{sd:+.2f} ft" if isinstance(sd, (int, float)) else "n/a"
-                        qd_str = f"{qd:+.0f} cfs" if isinstance(qd, (int, float)) else "n/a"
-                        line = f"NW RFC vs USGS (last): Δstage {sd_str}, Δflow {qd_str}"
-                        stdscr.addstr(row_y, 0, line[:max_x - 1], palette.get("dim", 0))
-                        row_y += 1
-
-                    # Forecast summary (if available).
-                    forecast_all = state.get("forecast", {}).get(selected, {})
-                    summary = forecast_all.get("summary") if isinstance(forecast_all, dict) else None
-                    bias = forecast_all.get("bias") if isinstance(forecast_all, dict) else None
-                    phase_shift_sec = forecast_all.get("phase_shift_sec") if isinstance(forecast_all, dict) else None
-                    if summary and row_y < max_y - 2:
-                        def fmt_peak(key: str) -> str:
-                            block = summary.get(key) or {}
-                            s = block.get("stage")
-                            q = block.get("flow")
-                            s_str = f"{s:.2f} ft" if isinstance(s, (int, float)) else "--"
-                            q_str = f"{int(q)} cfs" if isinstance(q, (int, float)) else "--"
-                            return f"{s_str} / {q_str}"
-
-                        line1 = (
-                            f"Forecast peaks (stage/flow): "
-                            f"3h {fmt_peak('max_3h')}  |  24h {fmt_peak('max_24h')}  |  full {fmt_peak('max_full')}"
-                        )
-                        stdscr.addstr(row_y, 0, line1[:max_x - 1], palette.get("dim", 0))
-                        row_y += 1
-
-                        if bias and row_y < max_y - 1:
-                            sd = bias.get("stage_delta")
-                            sr = bias.get("stage_ratio")
-                            qd = bias.get("flow_delta")
-                            qr = bias.get("flow_ratio")
-                            sd_str = f"{sd:+.2f} ft" if isinstance(sd, (int, float)) else "n/a"
-                            sr_str = f"{sr:.2f}×" if isinstance(sr, (int, float)) else "n/a"
-                            qd_str = f"{qd:+.0f} cfs" if isinstance(qd, (int, float)) else "n/a"
-                            qr_str = f"{qr:.2f}×" if isinstance(qr, (int, float)) else "n/a"
-                            line2 = f"Vs forecast now: Δstage {sd_str} ({sr_str}), Δflow {qd_str} ({qr_str})"
-                            stdscr.addstr(row_y, 0, line2[:max_x - 1], palette.get("dim", 0))
-                            row_y += 1
-
-                        if isinstance(phase_shift_sec, (int, float)) and row_y < max_y - 1:
-                            hours = phase_shift_sec / 3600.0
-                            sign = "earlier" if hours < 0 else "later"
-                            line3 = f"Peak timing: {abs(hours):.2f} h {sign} than forecast"
-                            stdscr.addstr(row_y, 0, line3[:max_x - 1], palette.get("dim", 0))
-            else:
-                # Compact detail: sparkline chart and summary stats.
-                chart_vals = _history_values(state, selected, chart_metric)
-                chart_line = _render_sparkline(chart_vals, width=max(10, max_x - 12))
-                chart_label = f"{chart_metric.upper()} history ({len(chart_vals)} pts, newest right)"
-                stdscr.addstr(detail_y + 3, 0, chart_label[:max_x - 1], palette.get("dim", 0))
-                stdscr.addstr(detail_y + 4, 0, chart_line[:max_x - 1], palette.get("chart", 0))
-                if chart_vals:
-                    delta = chart_vals[-1] - chart_vals[0]
-                    stats = f"{chart_metric}: min {min(chart_vals):.2f}  max {max(chart_vals):.2f}  Δ {delta:+.2f}"
-                    stdscr.addstr(detail_y + 5, 0, stats[:max_x - 1], palette.get("dim", 0))
-
-        footer_y = max_y - 2
-        if footer_y >= 0:
-            next_multi = _fmt_rel(now, next_poll_at) if next_poll_at else "pending"
-            footer = (
-                "[↑/↓] select  [Enter] details  [c] toggle chart metric  [b] toggle alert  [r] refresh  [f] force refetch  [q] quit  "
-                f"Next fetch: {next_multi}  |  {status_msg}"
-            )
-            stdscr.addstr(footer_y, 0, footer[:max_x - 1], palette.get("dim", 0))
-
-        info_y = footer_y + 1
-        if 0 <= info_y < max_y:
-            info_line = f"Mode: TUI adaptive | Alerts: {'on' if getattr(args, 'update_alert', True) else 'off'} | State: {args.state_file}"
-            stdscr.addstr(info_y, 0, info_line[:max_x - 1], palette.get("dim", 0))
-
-        stdscr.refresh()
 
     def run(stdscr: Any) -> int:
         curses.curs_set(0)
@@ -1933,7 +1960,22 @@ def tui_loop(args: argparse.Namespace) -> int:
                     state["meta"]["next_poll_at"] = next_poll_at.isoformat()
                     save_state(state_path, state)
 
-            draw_screen(stdscr, readings, state, selected_idx, chart_metric, status_msg, next_poll_at, palette, detail_mode)
+            draw_screen(
+                stdscr,
+                curses,
+                gauges,
+                readings,
+                state,
+                selected_idx,
+                chart_metric,
+                status_msg,
+                next_poll_at,
+                palette,
+                detail_mode,
+                TUI_TABLE_START,
+                args.state_file,
+                update_alert,
+            )
 
             key = stdscr.getch()
             if key in (ord("q"), ord("Q")):
@@ -1977,6 +2019,166 @@ def tui_loop(args: argparse.Namespace) -> int:
     try:
         with state_lock(state_path):
             return curses.wrapper(run)
+    except StateLockError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+async def web_tui_main(argv: list[str] | None = None) -> int:
+    """
+    Async-friendly TUI driver for Pyodide/browser builds.
+
+    This mirrors `tui_loop` but yields to the JS event loop via
+    `await asyncio.sleep(...)` so mobile Safari remains responsive.
+    """
+    import asyncio
+
+    args = parse_args(argv)
+    try:
+        import curses
+    except Exception as exc:
+        print("Curses backend is unavailable.", file=sys.stderr)
+        return 1
+
+    gauges = ordered_gauges()
+    TUI_TABLE_START = 3
+
+    stdscr = curses.initscr()
+    stdscr.nodelay(True)
+    stdscr.timeout(0)
+
+    palette: Dict[str, int] = {"normal": 0, "title": 0, "dim": 0, "chart": 0}
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        palette.update(
+            {
+                "normal": curses.color_pair(1),
+                "action": curses.color_pair(2),
+                "minor": curses.color_pair(2),
+                "moderate": curses.color_pair(3),
+                "major": curses.color_pair(3) | curses.A_BOLD,
+                "title": curses.color_pair(1) | curses.A_BOLD,
+                "dim": curses.color_pair(4),
+                "chart": curses.color_pair(4),
+            }
+        )
+
+    state_path = Path(args.state_file)
+    try:
+        with state_lock(state_path):
+            state = load_state(state_path)
+            maybe_backfill_state(state, args.backfill_hours)
+            save_state(state_path, state)
+            readings: Dict[str, Dict[str, Any]] = {}
+            selected_idx = 0
+            chart_metric = args.chart_metric
+            status_msg = "Awaiting first fetch..."
+            next_poll_at = datetime.now(timezone.utc)
+            retry_wait = args.min_retry_seconds
+            detail_mode = False
+            update_alert = getattr(args, "update_alert", True)
+
+            ui_tick = getattr(args, "ui_tick_sec", UI_TICK_SEC)
+            if not isinstance(ui_tick, (int, float)) or ui_tick <= 0:
+                ui_tick = UI_TICK_SEC
+
+            while True:
+                now = datetime.now(timezone.utc)
+                if now >= next_poll_at:
+                    state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
+                    fetched = fetch_gauge_data()
+                    if fetched:
+                        readings = fetched
+                        retry_wait = args.min_retry_seconds
+                        updates = update_state_with_readings(state, readings, poll_ts=now)
+                        maybe_refresh_forecasts(state, args)
+                        maybe_refresh_nwrfc(state, args)
+                        save_state(state_path, state)
+                        next_poll_at = schedule_next_poll(
+                            state,
+                            datetime.now(timezone.utc),
+                            args.min_retry_seconds,
+                        )
+                        status_msg = f"Fetched at {_fmt_clock(now)}; next {_fmt_rel(now, next_poll_at)}"
+                        state["meta"]["last_success_at"] = now.isoformat()
+                        state["meta"]["next_poll_at"] = next_poll_at.isoformat()
+                        save_state(state_path, state)
+                        if update_alert and any(updates.values()):
+                            try:
+                                curses.flash()
+                            except Exception:
+                                pass
+                            try:
+                                curses.beep()
+                            except Exception:
+                                pass
+                    else:
+                        status_msg = "Fetch failed; backing off."
+                        retry_wait = min(args.max_retry_seconds, retry_wait * 2)
+                        next_poll_at = now + timedelta(seconds=retry_wait)
+                        state["meta"]["last_failure_at"] = now.isoformat()
+                        state["meta"]["next_poll_at"] = next_poll_at.isoformat()
+                        save_state(state_path, state)
+
+                draw_screen(
+                    stdscr,
+                    curses,
+                    gauges,
+                    readings,
+                    state,
+                    selected_idx,
+                    chart_metric,
+                    status_msg,
+                    next_poll_at,
+                    palette,
+                    detail_mode,
+                    TUI_TABLE_START,
+                    args.state_file,
+                    update_alert,
+                )
+
+                key = stdscr.getch()
+                if key in (ord("q"), ord("Q")):
+                    return 0
+                if 3000 <= key < 4000:
+                    clicked_row = key - 3000
+                    first_gauge_row = TUI_TABLE_START + 1
+                    target = clicked_row - first_gauge_row
+                    if 0 <= target < len(gauges):
+                        if target == selected_idx:
+                            detail_mode = not detail_mode
+                        else:
+                            selected_idx = target
+                            detail_mode = True
+                        status_msg = f"Selected {gauges[selected_idx]} (tap/click to toggle detail)"
+                    await asyncio.sleep(0)
+                    continue
+
+                if key in (curses.KEY_UP, ord("k")):
+                    selected_idx = (selected_idx - 1) % len(gauges)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    selected_idx = (selected_idx + 1) % len(gauges)
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    detail_mode = not detail_mode
+                elif key in (ord("c"), ord("C")):
+                    chart_metric = "flow" if chart_metric == "stage" else "stage"
+                    status_msg = f"Chart metric: {chart_metric}"
+                elif key in (ord("b"), ord("B")):
+                    update_alert = not update_alert
+                    status_msg = f"Alerts: {'on' if update_alert else 'off'}"
+                elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
+                    next_poll_at = datetime.now(timezone.utc)
+                    if key in (ord("f"), ord("F")):
+                        status_msg = "Forced refetch requested..."
+                    else:
+                        status_msg = "Manual refresh requested..."
+
+                await asyncio.sleep(ui_tick)
     except StateLockError as exc:
         print(str(exc), file=sys.stderr)
         return 1

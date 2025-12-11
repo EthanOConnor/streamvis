@@ -121,3 +121,12 @@
 - **Mobile/iOS performance knob**:
   - Decision: add `--ui-tick-sec` (default 0.15) to let slow devices reduce UI frequency without affecting polling cadence.
   - Browser entrypoint uses `--ui-tick-sec 0.25` by default to keep Pyodide/Safari responsive.
+
+- **Async browser TUI driver**:
+  - Decision: add `web_tui_main()` implemented with `asyncio` and a non-blocking `getch()` loop so Pyodide yields to the JS event loop every UI tick.
+  - Rationale: iOS Safari becomes unresponsive if Python runs a tight synchronous loop on the main thread; an async driver prevents black-screen hangs and makes reload/stop responsive.
+  - Trade‑off: minor duplication of control logic vs native `tui_loop`, but layout/rendering is shared through top‑level `draw_screen`.
+
+- **Pyodide startup UX**:
+  - Decision: show a fixed loading bar with a fake‑progress meter and step labels during Pyodide + module loading.
+  - Rationale: startup can take several seconds on mobile; explicit progress reduces user confusion and gives feedback that the page is alive.

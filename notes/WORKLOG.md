@@ -118,3 +118,9 @@
 - Implemented per-cell color/attribute rendering in the Pyodide `web_curses` shim using span-based HTML output.
 - Added `--ui-tick-sec` CLI flag and set a slower default tick for the browser entrypoint to reduce CPU on mobile/iOS.
 - Tweaked web CSS for responsive font sizing, safe-area padding, and touch-friendly interaction.
+
+## 2025-12-11 – Pyodide loading UX and async web TUI
+
+- Refactored TUI rendering helpers (`color_for_status`, `draw_screen`) to top-level so both native and web drivers share layout/formatting.
+- Added an async `web_tui_main` that yields via `asyncio.sleep` to keep mobile Safari responsive; browser entrypoint now uses it.
+- Added a fixed loading bar with fake progress and step text in `web/main.js` + `web/index.html` to show Pyodide startup progress and avoid “black screen” confusion on slow loads.

@@ -297,3 +297,9 @@ Design vs implementation:
 - Hoist some nested TUI helpers to top level (esp. for future async web driver).
 - Optional debug/control summary logging for cadence/latency tuning.
 - Add a simple state schema version for forward compatibility.
+
+## 2025-12-11 – Pyodide/iOS responsiveness risk
+
+- **Risk – synchronous TUI loop blocks Safari**: running the native `tui_loop` inside Pyodide on the main thread can starve the JS event loop, leading to black screens and tab hangs on iOS.
+  - Resolution: added `web_tui_main()` using `asyncio` to yield every UI tick, and switched the browser entrypoint to use it.
+  - Residual check: if future features add long synchronous work per tick, re‑audit that the async loop still yields frequently.

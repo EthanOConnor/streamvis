@@ -135,3 +135,4 @@
 - Improved mobile tap targeting by accounting for scroll and padding in the JS click mapper; guarded against double-firing pointer/click events.
 - Adjusted tap UX so first tap selects a row and a second tap opens/closes details; switching rows in list view no longer auto-enters detail mode.
 - Made browser terminal sizing truly responsive (reduced hard minimum columns) and added adaptive table columns in `draw_screen` to avoid right-edge overflow on iOS.
+- Added dynamic font adaptation on resize/orientation: browser shrinks font to fit table columns before dropping columns, and grows font/table automatically when orientation widens.

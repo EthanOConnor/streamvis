@@ -37,7 +37,8 @@
       #terminal {
         white-space: pre;
         line-height: 1.2;
-        font-size: clamp(12px, 1.8vw, 16px);
+        font-size: var(--term-font-size, clamp(12px, 1.8vw, 16px));
+        transition: font-size 0.15s linear;
         padding: calc(8px + 40px) 8px calc(8px + env(safe-area-inset-bottom));
         height: 100vh;
         overflow: auto;

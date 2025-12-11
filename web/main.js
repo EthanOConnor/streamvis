@@ -8,6 +8,36 @@ const loadingProgressEl = document.getElementById("loading-progress");
 // Global key queue consumed by web_curses.getch().
 window.streamvisKeyQueue = [];
 
+function adaptTerminalFont() {
+  const rect = term.getBoundingClientRect();
+  const width = rect.width || window.innerWidth;
+  const height = rect.height || window.innerHeight;
+
+  // Aim to fit the full table on mobile by shrinking font first.
+  const desiredCols = width > height ? 62 : 54; // landscape vs portrait
+  const charFactor = 0.55; // matches web_curses estimation
+  const minFont = 10.5;
+  const maxFont = 16.0;
+
+  let fontPx = width / (desiredCols * charFactor);
+  fontPx = Math.max(minFont, Math.min(maxFont, fontPx));
+  term.style.setProperty("--term-font-size", `${fontPx.toFixed(1)}px`);
+}
+
+let resizePending = false;
+function scheduleFontAdapt() {
+  if (resizePending) return;
+  resizePending = true;
+  requestAnimationFrame(() => {
+    resizePending = false;
+    adaptTerminalFont();
+  });
+}
+
+window.addEventListener("resize", scheduleFontAdapt);
+window.addEventListener("orientationchange", scheduleFontAdapt);
+adaptTerminalFont();
+
 function setLoading(text, value) {
   if (loadingTextEl) loadingTextEl.textContent = text;
   if (loadingProgressEl) {

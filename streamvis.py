@@ -153,6 +153,16 @@ def _usgs_iv_url_from_config(cfg: Dict[str, Any]) -> str:
 # USGS gauge IDs for the Snoqualmie system we care about.
 SITE_MAP: Dict[str, str] = _site_map_from_config(CONFIG) or DEFAULT_SITE_MAP
 
+# Preferred ordering for gauges in CLI/TUI. Any additional gauges present
+# in SITE_MAP (e.g., Skagit at Concrete) are appended after these.
+PRIMARY_GAUGES: List[str] = ["TANW1", "GARW1", "SQUW1", "CRNW1"]
+
+
+def ordered_gauges() -> List[str]:
+    primary = [g for g in PRIMARY_GAUGES if g in SITE_MAP]
+    extras = [g for g in sorted(SITE_MAP.keys()) if g not in PRIMARY_GAUGES]
+    return primary + extras
+
 USGS_IV_URL = _usgs_iv_url_from_config(CONFIG)
 
 # Optional NW RFC text-plot endpoint used for cross-checking observed
@@ -161,9 +171,9 @@ USGS_IV_URL = _usgs_iv_url_from_config(CONFIG)
 NWRFC_TEXT_BASE = "https://www.nwrfc.noaa.gov/station/flowplot/textPlot.cgi"
 NWRFC_REFRESH_MIN = 15  # Minutes between NW RFC cross-checks when enabled.
 
-# For now we only wire GARW1; others can be added after verifying their IDs.
 NWRFC_ID_MAP: Dict[str, str] = {
     "GARW1": "GARW1",
+    "CONW1": "CONW1",
 }
 
 # Optional: rough flood thresholds for status coloring.
@@ -1431,7 +1441,8 @@ def render_table(readings: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> 
     print(header)
     print("-" * len(header))
 
-    for gauge_id in sorted(SITE_MAP.keys()):
+    gauges = ordered_gauges()
+    for gauge_id in gauges:
         reading = readings.get(gauge_id, {})
         stage = reading.get("stage")
         flow = reading.get("flow")
@@ -1464,7 +1475,7 @@ def tui_loop(args: argparse.Namespace) -> int:
         print("Curses is required for TUI mode and is unavailable on this platform.", file=sys.stderr)
         return 1
 
-    gauges = sorted(SITE_MAP.keys())
+    gauges = ordered_gauges()
 
     # Row index where the table header is drawn; gauge rows start at
     # TUI_TABLE_START + 1. This is shared with the web click/tap mapping.

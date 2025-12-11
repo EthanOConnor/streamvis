@@ -131,7 +131,7 @@ Important:
 
 - **Cross-check data (optional)** – NW RFC text flowplots: `https://www.nwrfc.noaa.gov/station/flowplot/textPlot.cgi`
   - Text hydrologic summaries (observed + forecast) for selected stations.
-  - When `--nwrfc-text` is enabled, `streamvis` periodically fetches the text plot for supported stations (currently `GARW1`) and:
+  - When `--nwrfc-text` is enabled, `streamvis` periodically fetches the text plot for supported stations (currently `GARW1` and `CONW1`) and:
     - Parses observed stage/flow time series in local time (PST/PDT) and converts to UTC.
     - Stores the series alongside USGS history in state.
     - Computes a simple per-timestamp difference vs the latest USGS observation when timestamps align (Δstage, Δflow).

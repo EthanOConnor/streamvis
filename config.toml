@@ -57,3 +57,11 @@ nwps_station_id = ""
 forecast_endpoint = ""
 fast_changes = false
 
+[stations.CONW1]
+gauge_id = "CONW1"
+display_name = "Skagit River near Concrete"
+usgs_site_no = "12194000"
+nws_lid = "CONW1"
+nwps_station_id = ""
+forecast_endpoint = ""
+fast_changes = false

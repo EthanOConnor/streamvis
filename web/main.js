@@ -8,14 +8,42 @@ const loadingProgressEl = document.getElementById("loading-progress");
 // Global key queue consumed by web_curses.getch().
 window.streamvisKeyQueue = [];
 
+let measureEl = null;
+function measureCharFactor(sampleFontPx = 14) {
+  if (!measureEl) {
+    measureEl = document.createElement("span");
+    measureEl.id = "streamvis-measure-js";
+    measureEl.style.position = "absolute";
+    measureEl.style.visibility = "hidden";
+    measureEl.style.whiteSpace = "pre";
+    measureEl.style.pointerEvents = "none";
+    measureEl.style.left = "-10000px";
+    measureEl.style.top = "-10000px";
+    document.body.appendChild(measureEl);
+  }
+  const style = getComputedStyle(term);
+  measureEl.style.fontFamily = style.fontFamily;
+  measureEl.style.fontSize = `${sampleFontPx}px`;
+  measureEl.textContent = "M".repeat(100);
+  const rect = measureEl.getBoundingClientRect();
+  const charWidth = rect.width > 0 ? rect.width / 100 : sampleFontPx * 0.6;
+  return charWidth / sampleFontPx;
+}
+
 function adaptTerminalFont() {
   const rect = term.getBoundingClientRect();
-  const width = rect.width || window.innerWidth;
-  const height = rect.height || window.innerHeight;
+  const rawWidth = rect.width || window.innerWidth;
+  const rawHeight = rect.height || window.innerHeight;
+  const style = getComputedStyle(term);
+  const padLeft = parseFloat(style.paddingLeft || "0") || 0;
+  const padRight = parseFloat(style.paddingRight || "0") || 0;
+  const width = Math.max(rawWidth - padLeft - padRight, 0);
+  const height = rawHeight;
 
   // Aim to fit the full table on mobile by shrinking font first.
-  const desiredCols = width > height ? 62 : 54; // landscape vs portrait
-  const charFactor = 0.55; // matches web_curses estimation
+  // Wide header requires 59 columns; keep a small landscape cushion.
+  const desiredCols = width > height ? 62 : 59; // landscape vs portrait
+  const charFactor = measureCharFactor(14);
   const minFont = 10.5;
   const maxFont = 16.0;
 

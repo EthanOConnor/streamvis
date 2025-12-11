@@ -236,7 +236,15 @@ Design vs implementation:
   - Ensure localStorage state syncing (`streamvis_state.json` ↔ `streamvis_state_json`) is robust to first-run (no file) and very large state files; consider trimming or compressing if the browser state grows.
 - Validation ideas:
   - Smoke-test the GitHub Pages build in Chrome/Firefox/Safari, including mobile, to ensure keyboard input, redraw, and state persistence behave as expected.
-  - When adding future features, keep the curses surface area small so that the `web_curses` shim stays easy to maintain and reason about.
+- When adding future features, keep the curses surface area small so that the `web_curses` shim stays easy to maintain and reason about.
+
+## 2025-12-11 – Web responsive overflow follow-up
+
+- **Issue**: On some iOS/Safari viewports the rightmost column could still be clipped even after font‑first adaptation, due to optimistic cols estimation (padding not subtracted, char width assumed as `font_px * 0.55`).
+- **Resolution**:
+  - `web_curses._measure_terminal` now derives usable text width/height by subtracting DOM padding and measures actual monospace `char_width_px`/`row_height_px` via a hidden span cached per font, making `getmaxyx()` conservative and accurate.
+  - `web/main.js` now calibrates `charFactor` from the same real DOM measurement and targets the full 59‑column wide header in portrait (62 in landscape) before allowing column drops.
+- **Residual risk**: If a user applies custom fonts or zoom levels that break monospace assumptions, measured factor should still track it, but we may want a small “fit safety margin” knob if we see edge cases; tracked in backlog if it resurfaces.
 
 ## 2025-12-10 – Meta scrutinizer refinement
 

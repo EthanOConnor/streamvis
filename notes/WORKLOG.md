@@ -136,3 +136,8 @@
 - Adjusted tap UX so first tap selects a row and a second tap opens/closes details; switching rows in list view no longer auto-enters detail mode.
 - Made browser terminal sizing truly responsive (reduced hard minimum columns) and added adaptive table columns in `draw_screen` to avoid right-edge overflow on iOS.
 - Added dynamic font adaptation on resize/orientation: browser shrinks font to fit table columns before dropping columns, and grows font/table automatically when orientation widens.
+
+## 2025-12-11 – Web terminal fit rigor
+
+- Reworked browser sizing to be measurement-driven: `web_curses._measure_terminal` now subtracts DOM padding and measures real monospace char width/row height via a hidden span, preventing optimistic col counts that could cut off the last column.
+- Updated `web/main.js` font adaptation to calibrate `charFactor` from real DOM text metrics and target the full 59‑column wide header in portrait before dropping columns.

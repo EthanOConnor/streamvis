@@ -33,6 +33,12 @@ KEY_ENTER = 343
 # Color pair mapping: pair_number -> {"fg": curses color const, "bg": curses color const}
 _color_pairs: Dict[int, Dict[str, int]] = {0: {"fg": COLOR_GREEN, "bg": -1}}
 
+# Cached DOM font metrics to avoid re-measuring every tick.
+_LAST_FONT_KEY: Tuple[float, float, str] | None = None
+_LAST_CHAR_WIDTH_PX: float | None = None
+_LAST_ROW_HEIGHT_PX: float | None = None
+_MEASURE_SPAN = None  # populated lazily under Pyodide
+
 
 def _encode_pair(pair_number: int) -> int:
     # Shift into high bits so OR-ing with attribute flags is safe.
@@ -102,15 +108,62 @@ def _measure_terminal() -> Tuple[int, int]:
             line_height = float(line_height_raw) * font_size_px
         else:
             line_height = 1.1 * font_size_px
-        row_height = max(line_height, font_size_px)
-        char_width = max(font_size_px * 0.55, 6.0)
+        font_family = (style.getPropertyValue("font-family") or "monospace").strip()
 
+        # Subtract padding so cols/rows represent usable text cells.
+        def _px(prop: str) -> float:
+            raw = style.getPropertyValue(prop) or "0px"
+            try:
+                return float(raw.replace("px", "")) if raw.endswith("px") else float(raw)
+            except Exception:
+                return 0.0
+
+        pad_left = _px("padding-left")
+        pad_right = _px("padding-right")
+        pad_top = _px("padding-top")
+        pad_bottom = _px("padding-bottom")
+
+        # Prefer clientWidth/Height (excludes scrollbars), fall back to rect.
         rect = el.getBoundingClientRect()
-        width = max(rect.width, 320.0)
-        height = max(rect.height, 320.0)
+        width = float(getattr(el, "clientWidth", 0) or rect.width or 0.0)
+        height = float(getattr(el, "clientHeight", 0) or rect.height or 0.0)
+        width = max(width - pad_left - pad_right, 0.0)
+        height = max(height - pad_top - pad_bottom, 0.0)
 
-        cols = int(width // char_width)
-        rows = int(height // row_height)
+        global _LAST_FONT_KEY, _LAST_CHAR_WIDTH_PX, _LAST_ROW_HEIGHT_PX, _MEASURE_SPAN
+        font_key = (round(font_size_px, 2), round(line_height, 2), font_family)
+        if font_key != _LAST_FONT_KEY or _LAST_CHAR_WIDTH_PX is None or _LAST_ROW_HEIGHT_PX is None:
+            if _MEASURE_SPAN is None:
+                span = document.createElement("span")
+                span.id = "streamvis-measure"
+                span.style.position = "absolute"
+                span.style.visibility = "hidden"
+                span.style.whiteSpace = "pre"
+                span.style.pointerEvents = "none"
+                span.style.left = "-10000px"
+                span.style.top = "-10000px"
+                document.body.appendChild(span)
+                _MEASURE_SPAN = span
+            span = _MEASURE_SPAN
+            span.style.fontFamily = font_family
+            span.style.fontSize = f"{font_size_px}px"
+            span.style.lineHeight = f"{line_height}px"
+            span.textContent = "M" * 100
+            mrect = span.getBoundingClientRect()
+            measured_width = float(getattr(mrect, "width", 0.0) or 0.0)
+            measured_height = float(getattr(mrect, "height", 0.0) or 0.0)
+            char_width = (measured_width / 100.0) if measured_width > 0 else (font_size_px * 0.6)
+            row_height = measured_height if measured_height > 0 else max(line_height, font_size_px)
+
+            _LAST_FONT_KEY = font_key
+            _LAST_CHAR_WIDTH_PX = max(char_width, 4.0)
+            _LAST_ROW_HEIGHT_PX = max(row_height, font_size_px)
+
+        char_width = _LAST_CHAR_WIDTH_PX or max(font_size_px * 0.6, 6.0)
+        row_height = _LAST_ROW_HEIGHT_PX or max(line_height, font_size_px)
+
+        cols = int(width // char_width) if char_width > 0 else 80
+        rows = int(height // row_height) if row_height > 0 else 24
 
         cols = max(40, min(cols, 200))
         rows = max(20, min(rows, 60))

@@ -155,7 +155,7 @@ SITE_MAP: Dict[str, str] = _site_map_from_config(CONFIG) or DEFAULT_SITE_MAP
 
 # Preferred ordering for gauges in CLI/TUI. Any additional gauges present
 # in SITE_MAP (e.g., Skagit at Concrete) are appended after these.
-PRIMARY_GAUGES: List[str] = ["TANW1", "GARW1", "SQUW1", "CRNW1"]
+PRIMARY_GAUGES: List[str] = ["TANW1", "GARW1", "EDGW1", "SQUW1", "CRNW1"]
 
 
 def ordered_gauges() -> List[str]:
@@ -199,6 +199,12 @@ FLOOD_THRESHOLDS: Dict[str, Dict[str, float | None]] = {
         "major": None,
     },
     "GARW1": {
+        "action": None,
+        "minor": None,
+        "moderate": None,
+        "major": None,
+    },
+    "EDGW1": {
         "action": None,
         "minor": None,
         "moderate": None,

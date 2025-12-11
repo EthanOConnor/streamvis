@@ -39,6 +39,15 @@ nwps_station_id = ""
 forecast_endpoint = ""
 fast_changes = false
 
+[stations.EDGW1]
+gauge_id = "EDGW1"
+display_name = "SF Snoqualmie River at Edgewick"
+usgs_site_no = "12143600"
+nws_lid = ""
+nwps_station_id = ""
+forecast_endpoint = ""
+fast_changes = false
+
 [stations.SQUW1]
 gauge_id = "SQUW1"
 display_name = "Snoqualmie River near Snoqualmie"

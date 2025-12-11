@@ -141,3 +141,10 @@
 
 - Reworked browser sizing to be measurement-driven: `web_curses._measure_terminal` now subtracts DOM padding and measures real monospace char width/row height via a hidden span, preventing optimistic col counts that could cut off the last column.
 - Updated `web/main.js` font adaptation to calibrate `charFactor` from real DOM text metrics and target the full 59‑column wide header in portrait before dropping columns.
+
+## 2025-12-11 – 15‑minute cadence prior + periodic backfill
+
+- Updated cadence learning to start from a 15‑minute base prior and snap to the best‑fitting 15‑minute multiple (15/30/60 min, etc.) once enough deltas support it; persisted `cadence_mult` and `cadence_fit` per gauge.
+- Adjusted EWMA updates to prefer snapped multiples when deltas land near the grid, while retaining a fallback snap‑up for slow irregular gauges.
+- Enabled default startup backfill (`--backfill-hours` now defaults to 6) and added low‑frequency periodic backfill checks to detect missed updates or cadence shifts.
+- Added regression tests for cadence snapping and missed‑update robustness.

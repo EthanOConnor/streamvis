@@ -146,3 +146,19 @@
 - **Pyodide startup UX**:
   - Decision: show a fixed loading bar with a fake‑progress meter and step labels during Pyodide + module loading.
   - Rationale: startup can take several seconds on mobile; explicit progress reduces user confusion and gives feedback that the page is alive.
+
+## 2025-12-11 – Cadence prior on 15‑minute grid
+
+- **Cadence model update**:
+  - Assumption: USGS gauges in this basin report on cadences that are multiples of 15 minutes (typically 15/30/60), with some observation→API latency.
+  - Decision: replace the old 8‑minute baseline with a 15‑minute base prior (`CADENCE_BASE_SEC = 900`) and snap learned intervals to the best‑fitting 15‑minute multiple once ≥3 deltas support it.
+  - Implementation:
+    - Each update delta is optionally snapped to the nearest 15‑minute multiple within a ±3‑minute tolerance before feeding the EWMA.
+    - Recent deltas are analyzed to pick the largest cadence multiple `k` such that most deltas are divisible by `k` (robust to missed updates); stored as `cadence_mult` with confidence `cadence_fit`.
+    - When confidence falls, we clear `cadence_mult` so EWMA can adapt to irregular behavior.
+  - Backfill:
+    - Backfill runs by default for 6 hours on startup to seed cadence multiples quickly.
+    - A low‑frequency periodic backfill check (~6h cadence, 6h lookback) re-aligns state if updates were missed or the upstream cadence changes.
+  - Trade‑offs:
+    - Slightly more startup bandwidth (one multi‑site history call) in exchange for fast convergence and lower steady‑state call rates.
+    - The learner will still track non‑grid cadences via EWMA if fit confidence is low.

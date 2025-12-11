@@ -105,7 +105,47 @@ class SchedulerTests(unittest.TestCase):
         mean_interval = state["gauges"]["GARW1"]["mean_interval_sec"]
         self.assertEqual(mean_interval, 3600.0)
 
+    def test_backfill_snaps_to_30min_multiple(self) -> None:
+        sv.SITE_MAP = {"GARW1": "00000000"}
+        state: Dict[str, Any] = {"gauges": {}, "meta": {}}
+        start = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        points = []
+        for i in range(5):
+            ts = start + timedelta(minutes=30 * i)
+            points.append({"ts": ts.isoformat(), "stage": 10.0, "flow": 1000.0})
+        sv.backfill_state_with_history(state, {"GARW1": points})
+        g_state = state["gauges"]["GARW1"]
+        self.assertEqual(g_state["mean_interval_sec"], 1800.0)
+        self.assertEqual(g_state.get("cadence_mult"), 2)
+
+    def test_estimator_handles_missed_updates(self) -> None:
+        deltas = [900.0, 1800.0, 2700.0, 900.0]
+        k, fit = sv._estimate_cadence_multiple(deltas)  # type: ignore[attr-defined]
+        self.assertEqual(k, 1)
+        self.assertGreaterEqual(fit, sv.CADENCE_FIT_THRESHOLD)
+
+    def test_irregular_deltas_do_not_snap(self) -> None:
+        sv.SITE_MAP = {"GARW1": "00000000"}
+        state: Dict[str, Any] = {"gauges": {}, "meta": {}}
+        start = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        for i in range(4):
+            ts = start + timedelta(minutes=20 * i)
+            readings = {
+                "GARW1": {
+                    "stage": 10.0,
+                    "flow": 1000.0,
+                    "status": "NORMAL",
+                    "observed_at": ts,
+                }
+            }
+            sv.update_state_with_readings(state, readings, poll_ts=ts)
+
+        g_state = state["gauges"]["GARW1"]
+        self.assertNotIn("cadence_mult", g_state)
+        mean_interval = g_state["mean_interval_sec"]
+        self.assertTrue(900.0 < mean_interval < 1800.0)
+        self.assertAlmostEqual(mean_interval, 1200.0, delta=250.0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

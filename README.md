@@ -48,17 +48,19 @@ streamvis --mode adaptive
 
 Behavior:
 
-- Fetches once immediately, then learns the typical update cadence per gauge (EWMA of observed intervals) starting from an 8-minute baseline.
+- Fetches once immediately, then learns the typical update cadence per gauge (EWMA of observed intervals) starting from a strong 15‑minute‑multiple prior (15/30/60 min, etc.) and snapping to the best‑fitting multiple once enough intervals are observed or backfilled.
 - Schedules the next multi-gauge request just before the next expected update (shared single call for all gauges).
 - If the prediction was early (no new timestamps), it widens the interval slightly and does a short retry (default 60s) so it converges toward ~1 call per new update.
 - Persisted state lives at `~/.streamvis_state.json` (override with `--state-file PATH`). Only the last timestamps, learned intervals, and last values are stored—no heavy history. A single-writer lock prevents two `streamvis` instances from using the same state file concurrently; start a second instance with a different `--state-file` if needed.
 - Learning has sensible floors/ceilings: sub-60-second deltas are ignored when learning cadence, and learned intervals are clamped to a reasonable range before scheduling the next fetch.
+- About every 6 hours, `streamvis` re-fetches a small recent history window to detect missed updates or cadence shifts and re-align the learner without adding noticeable load.
 
 Latency-aware scheduling:
 
 - For each station, `streamvis` tracks:
   - Observation cadence (seconds between gauge timestamps).
   - Observation→API latency as a window (lower/upper bounds) and robust stats (median, MAD).
+  - A cadence multiple confidence score (`cadence_fit`) used to decide when to trust the 15‑minute‑grid snap.
 - The scheduler uses a two-regime strategy:
   - Coarse polling while far from the expected next update (fraction of the learned interval, scaling with cadence bounds).
   - Short bursts of finer polling inside a narrow latency window for stations whose latency is stable (small MAD), to converge on update timing at second-level resolution without hammering the API.
@@ -68,7 +70,7 @@ Options:
 - `--debug`: emit per-poll control summaries (cadence, latency, calls/update) to stderr for tuning.
 - `--min-retry-seconds` (default 60): retry delay if the prediction was early.
 - `--max-retry-seconds` (default 300): ceiling when backing off on errors.
-- `--backfill-hours` (default 0): on startup, optionally backfill this many hours of recent history from USGS IV to seed the cadence learner and charts.
+- `--backfill-hours` (default 6): on startup, backfill this many hours of recent history from USGS IV to seed the cadence learner and charts (0 disables).
 - `--ui-tick-sec` (default 0.15): UI refresh tick in TUI mode; raise this on slow devices/browsers to reduce CPU.
 - `--no-update-alert`: in TUI mode, disable the bell/flash alert when new data is fetched.
 

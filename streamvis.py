@@ -22,9 +22,17 @@ except Exception:  # pragma: no cover
 STATE_FILE_DEFAULT = Path.home() / ".streamvis_state.json"
 # Increment when the on-disk state schema changes in a backward-incompatible way.
 STATE_SCHEMA_VERSION = 1
-# Start with a conservative 8-minute cadence and only speed up if
-# the data clearly updates more frequently.
-DEFAULT_INTERVAL_SEC = 8 * 60
+# Observation cadence prior.
+# Most Snoqualmie gauges update on 15-minute multiples (15/30/60 min).
+# We start from a 15-minute base and let deltas/backfill snap us to the
+# best-fitting multiple.
+CADENCE_BASE_SEC = 15 * 60
+CADENCE_SNAP_TOL_SEC = 3 * 60        # Acceptable jitter when snapping to base grid.
+CADENCE_FIT_THRESHOLD = 0.60        # Fraction of deltas that must fit a cadence multiple.
+CADENCE_CLEAR_THRESHOLD = 0.45      # Below this fit, clear an existing cadence multiple.
+
+# Default cadence prior (seconds).
+DEFAULT_INTERVAL_SEC = CADENCE_BASE_SEC
 MIN_RETRY_SEC = 60               # Short retry when we were early or on error.
 MAX_RETRY_SEC = 5 * 60           # Cap retry wait when backing off on errors.
 HEADSTART_SEC = 30               # Poll slightly before expected update.
@@ -34,6 +42,11 @@ UI_TICK_SEC = 0.15               # UI refresh tick for TUI mode.
 MIN_UPDATE_GAP_SEC = 60          # Ignore sub-60-second deltas when learning cadence.
 FORECAST_REFRESH_MIN = 60        # Do not refetch forecasts more often than this.
 MAX_LEARNABLE_INTERVAL_SEC = 6 * 3600  # Do not learn cadences longer than 6 hours.
+
+# Backfill behavior.
+DEFAULT_BACKFILL_HOURS = 6               # Backfill this much history on startup by default.
+PERIODIC_BACKFILL_INTERVAL_HOURS = 6     # How often to re-check recent history.
+PERIODIC_BACKFILL_LOOKBACK_HOURS = 6     # How much recent history to re-fetch on checks.
 
 # Fine/coarse polling control for adaptive scheduling.
 FINE_LATENCY_MAD_MAX_SEC = 60    # Only micro-poll if latency MAD <= 1 minute.
@@ -383,6 +396,83 @@ def _ewma(current_mean: float, new_value: float, alpha: float = EWMA_ALPHA) -> f
     return (1 - alpha) * current_mean + alpha * new_value
 
 
+def _snap_delta_to_cadence(delta_sec: float) -> tuple[float | None, int | None]:
+    """
+    Snap an observed update delta to the nearest 15-minute multiple.
+
+    Returns (snapped_delta, k) where k is the multiple of CADENCE_BASE_SEC.
+    If the delta is not close enough to a multiple, returns (None, None).
+    """
+    if delta_sec <= 0:
+        return None, None
+    k = int(round(delta_sec / CADENCE_BASE_SEC))
+    if k < 1:
+        return None, None
+    snapped = float(k * CADENCE_BASE_SEC)
+    if abs(snapped - delta_sec) <= CADENCE_SNAP_TOL_SEC:
+        return snapped, k
+    return None, None
+
+
+def _estimate_cadence_multiple(deltas_sec: List[float]) -> tuple[int | None, float]:
+    """
+    Estimate the underlying cadence multiple k (where cadence = k*CADENCE_BASE_SEC)
+    from a list of observed deltas.
+
+    The estimator is robust to missed updates: it chooses the largest k such that
+    a high fraction of deltas are integer multiples of k.
+    Returns (k, fit_fraction). k is None when confidence is low.
+    """
+    k_samples: List[int] = []
+    for d in deltas_sec:
+        snapped, k = _snap_delta_to_cadence(d)
+        if snapped is None or k is None:
+            continue
+        k_samples.append(k)
+
+    if len(k_samples) < 3:
+        return None, 0.0
+
+    max_k = max(k_samples)
+    best_k = 1
+    best_fit = 0.0
+    n = float(len(k_samples))
+    for cand in range(1, max_k + 1):
+        fit = sum(1 for k in k_samples if (k % cand) == 0) / n
+        if fit > best_fit + 1e-9 or (abs(fit - best_fit) <= 1e-9 and cand > best_k):
+            best_fit = fit
+            best_k = cand
+
+    if best_fit >= CADENCE_FIT_THRESHOLD:
+        return best_k, best_fit
+    return None, best_fit
+
+
+def _maybe_update_cadence_from_deltas(g_state: Dict[str, Any]) -> None:
+    """
+    If recent deltas strongly support a 15-minute multiple cadence, snap the
+    gauge's mean_interval_sec to that multiple and record confidence.
+    If confidence falls below CADENCE_CLEAR_THRESHOLD, clear the multiple so
+    the EWMA can adapt to irregular behavior.
+    """
+    deltas = g_state.get("deltas")
+    if not isinstance(deltas, list) or not deltas:
+        return
+    clean = [float(d) for d in deltas if isinstance(d, (int, float)) and d >= MIN_UPDATE_GAP_SEC]
+    if len(clean) < 3:
+        return
+
+    k, fit = _estimate_cadence_multiple(clean[-HISTORY_LIMIT:])
+    if k is not None:
+        g_state["cadence_mult"] = int(k)
+        g_state["cadence_fit"] = float(fit)
+        g_state["mean_interval_sec"] = float(k * CADENCE_BASE_SEC)
+    else:
+        g_state["cadence_fit"] = float(fit)
+        if fit < CADENCE_CLEAR_THRESHOLD and "cadence_mult" in g_state:
+            g_state.pop("cadence_mult", None)
+
+
 class StateLockError(RuntimeError):
     pass
 
@@ -511,6 +601,10 @@ def _cleanup_state(state: Dict[str, Any]) -> None:
         if not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
             mean_interval = DEFAULT_INTERVAL_SEC
         mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
+        cad_mult = g_state.get("cadence_mult")
+        if isinstance(cad_mult, int) and cad_mult > 0:
+            snapped = cad_mult * CADENCE_BASE_SEC
+            mean_interval = max(MIN_UPDATE_GAP_SEC, min(float(snapped), MAX_LEARNABLE_INTERVAL_SEC))
         g_state["mean_interval_sec"] = mean_interval
 
         # Clamp any stored latency stats.
@@ -673,14 +767,15 @@ def backfill_state_with_history(state: Dict[str, Any], history_map: Dict[str, Li
 
         if deltas:
             mean_interval = sum(deltas) / len(deltas)
-        else:
-            mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-
-        mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
-        g_state["mean_interval_sec"] = mean_interval
-        if deltas:
+            mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
+            g_state["mean_interval_sec"] = mean_interval
             g_state["last_delta_sec"] = deltas[-1]
             g_state["deltas"] = deltas[-HISTORY_LIMIT:]
+            _maybe_update_cadence_from_deltas(g_state)
+        else:
+            mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
+            mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
+            g_state["mean_interval_sec"] = mean_interval
 
 
 def maybe_backfill_state(state: Dict[str, Any], hours_back: int) -> None:
@@ -702,6 +797,36 @@ def maybe_backfill_state(state: Dict[str, Any], hours_back: int) -> None:
 
     backfill_state_with_history(state, history_map)
     meta["backfill_hours"] = max(int(previous or 0), int(hours_back))
+
+
+def maybe_periodic_backfill_check(
+    state: Dict[str, Any],
+    now: datetime,
+    lookback_hours: int = PERIODIC_BACKFILL_LOOKBACK_HOURS,
+) -> None:
+    """
+    Occasionally re-fetch a recent history window to detect missed updates
+    or cadence shifts.
+
+    This is intentionally low-frequency (hours) and uses a modest lookback
+    window so it remains polite while improving low-latency accuracy.
+    """
+    if lookback_hours <= 0:
+        return
+    meta = state.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        return
+    last_check = _parse_timestamp(meta.get("last_backfill_check")) if isinstance(meta.get("last_backfill_check"), str) else None
+    if last_check is not None:
+        elapsed = (now - last_check).total_seconds()
+        if elapsed < PERIODIC_BACKFILL_INTERVAL_HOURS * 3600:
+            return
+
+    history_map = fetch_gauge_history(lookback_hours)
+    if history_map:
+        backfill_state_with_history(state, history_map)
+
+    meta["last_backfill_check"] = now.isoformat()
 
 
 def _resolve_forecast_url(template: str, gauge_id: str, site_no: str) -> str:
@@ -1250,7 +1375,11 @@ def update_state_with_readings(
             delta_sec = (observed_at - prev_ts).total_seconds()
             if delta_sec >= MIN_UPDATE_GAP_SEC:
                 clamped = min(max(delta_sec, MIN_UPDATE_GAP_SEC), MAX_LEARNABLE_INTERVAL_SEC)
-                prev_mean = _ewma(prev_mean, clamped)
+                snapped, _k = _snap_delta_to_cadence(clamped)
+                if snapped is not None:
+                    prev_mean = _ewma(prev_mean, snapped)
+                else:
+                    prev_mean = _ewma(prev_mean, clamped)
                 last_delta = delta_sec
                 is_update = True
         elif prev_ts is None:
@@ -1297,13 +1426,11 @@ def update_state_with_readings(
             deltas.append(last_delta)
             if len(deltas) > HISTORY_LIMIT:
                 del deltas[0 : len(deltas) - HISTORY_LIMIT]
+            _maybe_update_cadence_from_deltas(g_state)
 
-            # If we have accumulated enough intervals and our learned mean
-            # is still significantly shorter than the typical observed delta,
-            # snap the mean upward toward the empirical average. This prevents
-            # slow-updating gauges (e.g., hourly) from being biased for too
-            # long by the short initial prior.
-            if len(deltas) >= 3:
+            # If we do not have a strong cadence multiple yet, ensure that a slow
+            # gauge can still snap upward quickly from the prior.
+            if "cadence_mult" not in g_state and len(deltas) >= 3:
                 avg_delta = sum(deltas) / len(deltas)
                 mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
                 if isinstance(mean_interval, (int, float)) and mean_interval < 0.75 * avg_delta:
@@ -2059,6 +2186,8 @@ def tui_loop(args: argparse.Namespace) -> int:
                     readings = fetched
                     retry_wait = args.min_retry_seconds
                     updates = update_state_with_readings(state, readings, poll_ts=now)
+                    if getattr(args, "backfill_hours", DEFAULT_BACKFILL_HOURS) > 0:
+                        maybe_periodic_backfill_check(state, now)
                     maybe_refresh_forecasts(state, args)
                     maybe_refresh_nwrfc(state, args)
                     save_state(state_path, state)
@@ -2335,6 +2464,8 @@ def adaptive_loop(args: argparse.Namespace) -> int:
 
                 retry_wait = args.min_retry_seconds
                 updates = update_state_with_readings(state, readings, poll_ts=now)
+                if getattr(args, "backfill_hours", DEFAULT_BACKFILL_HOURS) > 0:
+                    maybe_periodic_backfill_check(state, now)
                 maybe_refresh_forecasts(state, args)
                 save_state(state_path, state)
 
@@ -2416,8 +2547,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--backfill-hours",
         type=int,
-        default=0,
-        help="On start, backfill this many hours of recent history from USGS IV (0 to disable).",
+        default=DEFAULT_BACKFILL_HOURS,
+        help=(
+            "On start, backfill this many hours of recent history from USGS IV "
+            f"(default {DEFAULT_BACKFILL_HOURS}; 0 to disable)."
+        ),
     )
     parser.add_argument(
         "--chart-metric",

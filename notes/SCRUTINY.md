@@ -91,8 +91,8 @@ Scheduler (`schedule_next_poll`):
 - Fine regime:
   - Inside a “latency window” ±lat_width around `next_api`, poll with step between 5 and 30 seconds (`FINE_STEP_MIN_SEC`, `FINE_STEP_MAX_SEC`) (`streamvis.py:935`–`streamvis.py:947`).
 - Coarse regime:
-  - Poll at max of `min_retry_seconds` and a fraction of the mean interval, capped at `COARSE_STEP_MAX_SEC` (300s) (`streamvis.py:950`–`streamvis.py:965`).
-- Multi-gauge coordination picks the earliest candidate time across gauges and then clamps it to `now + max_retry_seconds` (`streamvis.py:979`–`streamvis.py:983`).
+  - Poll at max of `min_retry_seconds` and a fraction of the mean interval (no hard cap beyond cadence clamping) (`streamvis.py:950`–`streamvis.py:965`).
+- Multi-gauge coordination picks the earliest candidate time across gauges (`streamvis.py:979`–`streamvis.py:983`).
 
 Design vs implementation:
 
@@ -281,9 +281,9 @@ Design vs implementation:
 
 **P1 – High‑impact follow‑ups**
 
-- **Coarse polling cap may oversample slow gauges**: `COARSE_STEP_MAX_SEC = 5m` means even hourly+ gauges are polled every ~5m in coarse regime. This diverges from the “~1 call per real update” story in slow‑gauge‑only scenarios. Recommendation: allow coarse steps to scale with cadence (e.g., cap at a fraction of mean interval) and add instrumentation for “calls per update.”
-- **Web hosting path clarity**: `web/main.js` loads modules via `../*.py`, so GH Pages must serve Python files at repo root, not only from `web/`. README should make this explicit or paths adjusted.
-- **No automated scheduler regression tests**: convert key scenarios in `scheduler_harness.py` into stdlib unit tests covering cadence convergence, fine‑window eligibility, and mixed‑gauge behavior.
+- **Coarse polling oversampling slow gauges** (resolved 2025‑12‑11): removed the 5‑minute hard cap so coarse steps scale with learned cadence; added per‑gauge “calls/update” instrumentation (last + EWMA) surfaced in expanded TUI detail.
+- **Web hosting path clarity** (resolved 2025‑12‑11): browser loader now tries both `./module.py` and `../module.py`; README documents the two supported GitHub Pages layouts.
+- **Scheduler regression tests** (resolved 2025‑12‑11): added stdlib unit coverage for coarse scaling, fine‑window stepping, and cadence snap‑up in `tests/test_scheduler.py`.
 
 **P2 – Medium priority**
 

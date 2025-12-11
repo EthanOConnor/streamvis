@@ -60,7 +60,7 @@ Latency-aware scheduling:
   - Observation cadence (seconds between gauge timestamps).
   - Observation→API latency as a window (lower/upper bounds) and robust stats (median, MAD).
 - The scheduler uses a two-regime strategy:
-  - Coarse polling while far from the expected next update (fraction of the learned interval, capped).
+  - Coarse polling while far from the expected next update (fraction of the learned interval, scaling with cadence bounds).
   - Short bursts of finer polling inside a narrow latency window for stations whose latency is stable (small MAD), to converge on update timing at second-level resolution without hammering the API.
 
 Options:
@@ -171,8 +171,10 @@ Note: TUI mode uses Python `curses` (available on macOS/Linux; Windows users may
 
 To host this on GitHub Pages:
 
-1. Commit `web/index.html` and `web/main.js` along with the Python modules in the repo root (`streamvis.py`, `http_client.py`, `web_curses.py`, `web_entrypoint.py`, `config.toml`).
-2. Configure GitHub Pages to serve the `web/` directory (or copy these files into your chosen Pages root).
+1. Publish `web/index.html` and `web/main.js` alongside the Python modules (`streamvis.py`, `http_client.py`, `web_curses.py`, `web_entrypoint.py`, `config.toml`).
+   - If GitHub Pages serves the repo root, keep the Python files at root and open `/web/`.
+   - If GitHub Pages serves `web/` as the Pages root, copy the Python files into `web/` as well. The loader will try both `./module.py` and `../module.py`.
+2. Configure GitHub Pages to serve either the repo root or the `web/` directory, matching the layout above.
 3. Open the Pages URL on your phone or desktop; the page will load Pyodide from a CDN and start `streamvis` in TUI mode inside the browser.
 
 ## Backlog

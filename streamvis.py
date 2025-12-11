@@ -33,7 +33,8 @@ FINE_WINDOW_MIN_SEC = 30         # Minimum half-width of fine window.
 FINE_STEP_MIN_SEC = 15           # Minimum fine-mode poll step (keep bursts polite).
 FINE_STEP_MAX_SEC = 30           # Maximum fine-mode poll step.
 COARSE_STEP_FRACTION = 0.5       # Coarse step ~ fraction of mean interval.
-COARSE_STEP_MAX_SEC = 5 * 60     # Do not coarse-poll more often than this.
+# We no longer hard-cap coarse steps; mean_interval is already clamped, so
+# slow gauges can sleep proportionally longer without excess polling.
 
 CONFIG_PATH = Path(__file__).with_name("config.toml")
 
@@ -1187,6 +1188,19 @@ def update_state_with_readings(
         if len(history) > HISTORY_LIMIT:
             del history[0 : len(history) - HISTORY_LIMIT]
 
+        # Instrumentation: how many polls did it take to observe this update?
+        # We treat strictly newer timestamps as updates; same-timestamp
+        # parameter refreshes do not count.
+        if is_update:
+            polls_since_update = int(no_update_polls) if isinstance(no_update_polls, (int, float)) else 0
+            polls_this_update = polls_since_update + 1
+            prev_polls_ewma = g_state.get("polls_per_update_ewma")
+            if isinstance(prev_polls_ewma, (int, float)) and prev_polls_ewma > 0:
+                g_state["polls_per_update_ewma"] = _ewma(float(prev_polls_ewma), float(polls_this_update))
+            else:
+                g_state["polls_per_update_ewma"] = float(polls_this_update)
+            g_state["last_polls_per_update"] = polls_this_update
+
         if is_update and last_delta is not None:
             deltas = g_state.setdefault("deltas", [])
             deltas.append(last_delta)
@@ -1370,7 +1384,7 @@ def schedule_next_poll(
                 # Coarse region around a known fine window: walk towards it.
                 coarse_step = max(
                     min_retry_seconds,
-                    min(COARSE_STEP_MAX_SEC, mean_interval * COARSE_STEP_FRACTION),
+                    mean_interval * COARSE_STEP_FRACTION,
                 )
                 target = fine_start if now < fine_start else next_api
                 candidate = max(
@@ -1382,7 +1396,7 @@ def schedule_next_poll(
             # the predicted next API time.
             coarse_step = max(
                 min_retry_seconds,
-                min(COARSE_STEP_MAX_SEC, mean_interval * COARSE_STEP_FRACTION),
+                mean_interval * COARSE_STEP_FRACTION,
             )
             candidate = max(
                 now + timedelta(seconds=min_retry_seconds),
@@ -1664,6 +1678,19 @@ def tui_loop(args: argparse.Namespace) -> int:
                         ls = int(round(latency_mad)) if isinstance(latency_mad, (int, float)) else 0
                         lat_line = f"Latency (obs→API): median {lm}s, MAD {ls}s"
                         stdscr.addstr(row_y, 0, lat_line[:max_x - 1], palette.get("dim", 0))
+                        row_y += 1
+
+                    # Poll efficiency (calls per real update).
+                    last_polls = g_state.get("last_polls_per_update")
+                    polls_ewma = g_state.get("polls_per_update_ewma")
+                    if (
+                        (isinstance(last_polls, (int, float)) or isinstance(polls_ewma, (int, float)))
+                        and row_y < max_y - 2
+                    ):
+                        last_str = f"{int(last_polls)}" if isinstance(last_polls, (int, float)) else "--"
+                        ewma_str = f"{float(polls_ewma):.2f}" if isinstance(polls_ewma, (int, float)) else "--"
+                        calls_line = f"Calls/update: last {last_str}  ewma {ewma_str}"
+                        stdscr.addstr(row_y, 0, calls_line[:max_x - 1], palette.get("dim", 0))
                         row_y += 1
 
                     # NW RFC cross-check (if available).

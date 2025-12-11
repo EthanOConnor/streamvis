@@ -98,3 +98,10 @@
 - Fixed packaging so `pip install .` includes required peer modules (`http_client.py`, `web_curses.py`, `web_entrypoint.py`) and installed `streamvis` runs cleanly.
 - Added timeout-aware `getch()` behavior in `web_curses.py` to prevent Pyodide/browser TUI busy-looping.
 - Recorded a comprehensive, prioritized review and follow-ups in `notes/SCRUTINY.md` and design decisions in `notes/MEMORY.md`.
+
+## 2025-12-11 – P1 scheduler + web hardening
+
+- Removed the coarse-step hard cap so adaptive polling for slow gauges scales with learned cadence; added per-gauge “calls/update” instrumentation (last + EWMA) and surfaced it in expanded TUI detail.
+- Hardened the Pyodide browser harness by letting `web/main.js` try both local and parent module paths; clarified GitHub Pages hosting layouts in `README.md`.
+- Added stdlib regression tests for scheduler and cadence snap‑up behavior in `tests/test_scheduler.py`.
+- Adjusted `http_client.py` to lazy-import `requests` so offline/unit-test environments can import `streamvis` without the dependency installed.

@@ -84,3 +84,15 @@
   - The native TUI relies on `curses.timeout()` to avoid busy‑looping between UI ticks.
   - Decision: implement synchronous timeout semantics in `web_curses.getch()` (sleeping for the configured timeout) as a short‑term, dependency‑free fix to prevent pegged CPU in Pyodide.
   - Trade‑off: input is only serviced between ticks (≤ UI_TICK_SEC), which is acceptable for interactive use; longer‑term async `web_tui_main()` remains on `notes/BACKLOG.md` for a fully cooperative browser loop.
+
+## 2025-12-11 – Polite coarse scheduling and efficiency metric
+
+- **Coarse scheduling philosophy**:
+  - Decision: remove the absolute 5‑minute coarse‑poll cap. Mean intervals are already clamped to ≤ 6 hours, so coarse steps now scale as a fraction of the learned cadence.
+  - Result: in all‑slow scenarios, the tool sleeps proportionally longer (≈ half‑interval) and avoids polling 10–12× per update on multi‑hour gauges.
+  - Trade‑off: if a truly slow gauge suddenly accelerates its cadence, detection may lag until the next coarse poll; this is accepted in favor of politeness and can be revisited per‑station if needed.
+
+- **Calls‑per‑update instrumentation**:
+  - We persist `no_update_polls` per gauge to count consecutive polls with no new timestamp.
+  - On a real update, we record `last_polls_per_update = no_update_polls + 1` and update `polls_per_update_ewma` using the standard EWMA alpha.
+  - Expanded TUI detail surfaces both values so we can tune scheduler constants without extra dependencies or heavy logging.

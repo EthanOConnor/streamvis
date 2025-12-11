@@ -57,14 +57,34 @@ term.addEventListener("click", (ev) => {
 });
 
 async function loadPythonModule(pyodide, path) {
-  const resp = await fetch(path);
-  if (!resp.ok) {
-    throw new Error(`Failed to load ${path}: ${resp.status} ${resp.statusText}`);
+  const candidates = [path];
+  if (path.startsWith("../")) {
+    candidates.push(path.slice(3));
+  } else {
+    candidates.push("../" + path);
   }
-  const src = await resp.text();
 
-  // Derive module name from the filename (e.g., "../http_client.py" → "http_client").
-  const parts = path.split("/");
+  let src = null;
+  let usedPath = null;
+  for (const candidate of candidates) {
+    try {
+      const resp = await fetch(candidate);
+      if (resp.ok) {
+        src = await resp.text();
+        usedPath = candidate;
+        break;
+      }
+    } catch (_err) {
+      // Try the next candidate.
+    }
+  }
+
+  if (src === null || usedPath === null) {
+    throw new Error(`Failed to load ${path} (tried ${candidates.join(", ")})`);
+  }
+
+  // Derive module name from the filename (e.g., "streamvis.py" → "streamvis").
+  const parts = usedPath.split("/");
   const filename = parts[parts.length - 1];
   const moduleName = filename.endsWith(".py") ? filename.slice(0, -3) : filename;
 

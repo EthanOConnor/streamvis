@@ -32,7 +32,13 @@ try:
 except Exception:
     # Native CPython branch.
     _USE_PYODIDE = False
-    import requests  # type: ignore[import]
+    try:
+        import requests  # type: ignore[import]
+    except Exception as exc:  # pragma: no cover
+        requests = None  # type: ignore[assignment]
+        _REQUESTS_IMPORT_ERROR = exc
+    else:
+        _REQUESTS_IMPORT_ERROR = None
 
 
 def get_text(
@@ -52,6 +58,10 @@ def get_text(
         - Relies on browser fetch + CORS.
     """
     if not _USE_PYODIDE:
+        if requests is None:  # pragma: no cover
+            raise RuntimeError(
+                "requests is required for native HTTP; install streamvis with pip to pull it in."
+            ) from _REQUESTS_IMPORT_ERROR
         resp = requests.get(url, params=params, timeout=timeout)  # type: ignore[name-defined]
         resp.raise_for_status()
         return resp.text
@@ -73,10 +83,13 @@ def get_json(
     catch generically.
     """
     if not _USE_PYODIDE:
+        if requests is None:  # pragma: no cover
+            raise RuntimeError(
+                "requests is required for native HTTP; install streamvis with pip to pull it in."
+            ) from _REQUESTS_IMPORT_ERROR
         resp = requests.get(url, params=params, timeout=timeout)  # type: ignore[name-defined]
         resp.raise_for_status()
         return resp.json()
 
     text = get_text(url, params=params, timeout=timeout)
     return json.loads(text)
-

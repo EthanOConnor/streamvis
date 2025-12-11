@@ -148,3 +148,7 @@
 - Adjusted EWMA updates to prefer snapped multiples when deltas land near the grid, while retaining a fallback snap‑up for slow irregular gauges.
 - Enabled default startup backfill (`--backfill-hours` now defaults to 6) and added low‑frequency periodic backfill checks to detect missed updates or cadence shifts.
 - Added regression tests for cadence snapping and missed‑update robustness.
+
+## 2025-12-11 – Web favicon
+
+- Added a simple STREAMVIS favicon (`web/favicon.svg`) with Snoqualmie wave lines and a gauge marker, and wired it into `web/index.html`.

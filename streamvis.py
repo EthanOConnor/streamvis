@@ -1730,7 +1730,9 @@ def tui_loop(args: argparse.Namespace) -> int:
 
     def run(stdscr: Any) -> int:
         curses.curs_set(0)
-        stdscr.nodelay(True)
+        # In TUI mode we want near-zero CPU usage when idle, so we rely on
+        # a small blocking timeout for getch() instead of a busy loop.
+        stdscr.nodelay(False)
         stdscr.timeout(int(UI_TICK_SEC * 1000))
         palette: Dict[str, int] = {"normal": 0, "title": 0, "dim": 0, "chart": 0}
 

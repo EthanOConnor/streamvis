@@ -2537,6 +2537,16 @@ def draw_screen(
             f"Observed {_fmt_clock(observed_at, with_date=False)} ({_fmt_rel(now, observed_at)}), "
             f"Next ETA: {_fmt_rel(now, next_eta) if next_eta and next_eta >= now else 'now'}"
         )
+        latency_loc = g_state.get("latency_loc_sec")
+        latency_scale = g_state.get("latency_scale_sec")
+        if not isinstance(latency_loc, (int, float)):
+            latency_loc = g_state.get("latency_median_sec")
+        if not isinstance(latency_scale, (int, float)):
+            latency_scale = g_state.get("latency_mad_sec")
+        if isinstance(latency_loc, (int, float)):
+            ll = int(round(latency_loc))
+            ls = int(round(latency_scale)) if isinstance(latency_scale, (int, float)) else 0
+            timing += f" | Latency {ll}±{ls}s"
         stdscr.addstr(detail_y, 0, detail[:max_x - 1], palette.get("normal", 0) | curses_mod.A_BOLD)
         stdscr.addstr(detail_y + 1, 0, timing[:max_x - 1], palette.get("normal", 0))
 

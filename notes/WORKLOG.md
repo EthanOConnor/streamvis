@@ -171,3 +171,7 @@
 
 - Added per‑gauge phase offset estimation for snapped cadences and use it to predict next *API‑visible* update times.
 - Switched latency stats from median/MAD to Tukey biweight location/scale with a 600s±100s prior and clamped per‑update latency samples within visibility windows.
+
+## 2025-12-12 – Latency visibility in compact detail
+
+- Surfaced per‑gauge latency location/scale (`latency_loc_sec ± latency_scale_sec`) in the always‑visible station detail timing line, not just expanded detail mode.

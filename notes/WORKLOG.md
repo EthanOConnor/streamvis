@@ -166,3 +166,8 @@
 
 - Added an opportunistic `modifiedSince` duration filter to USGS IV fetches when all tracked gauges have ≤1h cadences, reducing payload by omitting unchanged stations without risking missed updates on slow gauges.
 - `fetch_gauge_data(state)` now backfills omitted series from persisted state so the UI remains stable while still counting “no‑update” polls correctly.
+
+## 2025-12-12 – Phase + biweight latency
+
+- Added per‑gauge phase offset estimation for snapped cadences and use it to predict next *API‑visible* update times.
+- Switched latency stats from median/MAD to Tukey biweight location/scale with a 600s±100s prior and clamped per‑update latency samples within visibility windows.

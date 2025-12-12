@@ -179,6 +179,21 @@ class SchedulerTests(unittest.TestCase):
         slow_state = {"gauges": {"A": {"mean_interval_sec": 7200}}}
         self.assertIsNone(sv._compute_modified_since(slow_state))  # type: ignore[attr-defined]
 
+    def test_phase_offset_estimation(self) -> None:
+        g_state: Dict[str, Any] = {
+            "mean_interval_sec": 900.0,
+            "cadence_mult": 1,
+            "history": [
+                {"ts": "2025-01-01T00:05:00+00:00"},
+                {"ts": "2025-01-01T00:20:00+00:00"},
+                {"ts": "2025-01-01T00:35:00+00:00"},
+            ],
+        }
+        phase = sv._estimate_phase_offset_sec(g_state)  # type: ignore[attr-defined]
+        self.assertIsNotNone(phase)
+        if phase is not None:
+            self.assertAlmostEqual(phase, 300.0, delta=30.0)
+
 
 if __name__ == "__main__":
     unittest.main()

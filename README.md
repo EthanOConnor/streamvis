@@ -60,11 +60,11 @@ Latency-aware scheduling:
 
 - For each station, `streamvis` tracks:
   - Observation cadence (seconds between gauge timestamps).
-  - Observation→API latency as a window (lower/upper bounds) and robust stats (median, MAD).
+  - Observation→API latency as a window (lower/upper bounds) and robust stats (Tukey biweight location/scale).
   - A cadence multiple confidence score (`cadence_fit`) used to decide when to trust the 15‑minute‑grid snap.
 - The scheduler uses a two-regime strategy:
   - Coarse polling while far from the expected next update (fraction of the learned interval, scaling with cadence bounds).
-  - Short bursts of finer polling inside a narrow latency window for stations whose latency is stable (small MAD), to converge on update timing at second-level resolution without hammering the API.
+  - Short bursts of finer polling inside a narrow latency window for stations whose latency is stable (small robust scale), to converge on update timing at second-level resolution without hammering the API.
 
 Options:
 

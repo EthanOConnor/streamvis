@@ -180,3 +180,16 @@
   - The WaterServices IV endpoint supports a `modifiedSince` parameter as an ISO‑8601 duration (e.g., `PT30M`) that returns time series only for stations whose values changed within that recent window. citeturn0search0turn0search1
   - Decision: when all tracked gauges have learned cadences ≤1 hour, include a narrow `modifiedSince` window (max(2×min cadence, 30 min)) to omit unchanged stations and reduce bandwidth on early/no‑update polls. If any gauge is slower than 1 hour, omit `modifiedSince` to avoid suppressing older-but-new-to-us updates.
   - UX safeguard: `fetch_gauge_data(state)` fills any omitted station rows from persisted `last_*` values so the main table doesn’t go blank, and it sets `observed_at` to the last known timestamp so no‑update polls are still counted for politeness metrics.
+
+## 2025-12-12 – Phase + biweight latency
+
+- **API‑time prediction**:
+  - Decision: predict the *API‑visible* next update time by combining the snapped cadence grid + a per‑gauge phase offset (`phase_offset_sec`) with a robust latency location estimate. This aligns ETA with when new data will actually be fetchable.
+- **Latency prior**:
+  - Start with a strong latency prior of ~600s location and ~100s scale (based on basin experience). This gives reasonable ETAs before enough samples accumulate.
+- **Latency estimation**:
+  - Replace median/MAD with Tukey’s biweight location/scale on latency samples (`latencies_sec`). Use c≈6 for location and c≈9 for scale.
+  - Each latency sample is chosen as the most‑likely value within the last‑poll/this‑poll visibility window by clamping the current prior location into `[lower, upper]`.
+- **Phase estimation**:
+  - When a gauge locks onto a 15‑minute multiple cadence (`cadence_mult`), estimate its typical phase offset within that cadence from recent observation timestamps using a robust biweight location on unwrapped modulo offsets.
+  - Prediction uses the next grid time after `max(last_ts, now)`.

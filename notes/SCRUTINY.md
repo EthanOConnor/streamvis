@@ -273,6 +273,12 @@ Design vs implementation:
 - **Semantics**: `modifiedSince` on IV is a *duration*, not an absolute timestamp, and filters out stations with no changes in that window. We gate usage to fast‑cadence‑only sessions to avoid missing slow‑gauge updates. citeturn0search0turn0search1
 - **UX risk**: When `modifiedSince` suppresses a station, IV omits its time series entirely. We now backfill display values from state and still count a no‑update poll by setting `observed_at` to the last stored timestamp.
 
+## 2025-12-12 – Phase/biweight latency scrutiny
+
+- **Phase estimator**: Uses biweight location on unwrapped modulo offsets; should handle wrap-around, but if a gauge switches cadence multiples mid‑run we may briefly predict a wrong phase until new history accumulates. Cadence snap logic clears `cadence_mult` when fit drops, which implicitly disables phase.
+- **Latency prior bias**: The 600s±100s prior is strong early; if a gauge has materially different latency, fine windows will wait for a few samples before tightening. We can retune priors if field data suggests otherwise.
+- **Biweight robustness**: Biweight downweights large outliers but still assumes a roughly unimodal core; if latency becomes bimodal (e.g., periodic batch publishes), scale may be underestimated. Watch `control_summary` during storms and adjust if needed.
+
 ## 2025-12-10 – Meta scrutinizer refinement
 
 - **Critical – TUI trend crash when stages are absent** (`streamvis.py:1219`–`1225`): `dh` is only set when stage data exists, yet the flow trend divides by `dh` regardless. A flow-only gauge would raise `UnboundLocalError`. Seed `dh` from the time span of the flow samples (or default to `1.0`) before either trend calculation.

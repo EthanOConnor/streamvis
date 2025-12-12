@@ -55,6 +55,13 @@ NEARBY_DISCOVERY_EXPAND_FACTOR = 2.0
 NEARBY_DISCOVERY_MIN_INTERVAL_HOURS = 24.0
 DYNAMIC_GAUGE_PREFIX = "U"  # Prefix for dynamically-added gauges.
 
+# Latency priors and robust estimation (Tukey biweight).
+LATENCY_PRIOR_LOC_SEC = 600.0
+LATENCY_PRIOR_SCALE_SEC = 100.0
+BIWEIGHT_LOC_C = 6.0
+BIWEIGHT_SCALE_C = 9.0
+BIWEIGHT_MAX_ITERS = 5
+
 # Fine/coarse polling control for adaptive scheduling.
 FINE_LATENCY_MAD_MAX_SEC = 60    # Only micro-poll if latency MAD <= 1 minute.
 FINE_WINDOW_MIN_SEC = 30         # Minimum half-width of fine window.
@@ -515,6 +522,85 @@ def _compute_modified_since(state: Dict[str, Any]) -> str | None:
     return _iso8601_duration(window_sec)
 
 
+def _median(values: List[float]) -> float:
+    vals = sorted(values)
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2 == 1:
+        return float(vals[mid])
+    return 0.5 * (float(vals[mid - 1]) + float(vals[mid]))
+
+
+def _mad(values: List[float], center: float) -> float:
+    devs = [abs(v - center) for v in values]
+    return _median(devs) if devs else 0.0
+
+
+def tukey_biweight_location_scale(
+    values: List[float],
+    initial_loc: float,
+    initial_scale: float,
+    c_loc: float = BIWEIGHT_LOC_C,
+    c_scale: float = BIWEIGHT_SCALE_C,
+    max_iters: int = BIWEIGHT_MAX_ITERS,
+) -> tuple[float, float]:
+    """
+    Tukey's biweight (bisquare) robust location and scale.
+
+    Location uses tuning constant c_loc (default 6), scale uses c_scale (default 9),
+    following common robust-statistics practice.
+    """
+    clean = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0]
+    if not clean:
+        return float(initial_loc), float(max(0.0, initial_scale))
+
+    loc = float(initial_loc)
+    scale = float(max(initial_scale, 1e-6))
+
+    # Iterative biweight location.
+    for _ in range(max(1, int(max_iters))):
+        denom = c_loc * scale
+        if denom <= 0:
+            break
+        num = 0.0
+        den = 0.0
+        for v in clean:
+            u = (v - loc) / denom
+            if abs(u) >= 1.0:
+                continue
+            w = (1.0 - u * u) ** 2
+            num += (v - loc) * w
+            den += w
+        if den <= 1e-12:
+            break
+        delta = num / den
+        if abs(delta) < 1e-3:
+            loc += delta
+            break
+        loc += delta
+
+    # Biweight scale (midvariance) using final loc and initial scale.
+    denom = c_scale * scale
+    if denom <= 0:
+        return loc, 0.0
+    num = 0.0
+    den = 0.0
+    for v in clean:
+        u = (v - loc) / denom
+        if abs(u) >= 1.0:
+            continue
+        one_minus = 1.0 - u * u
+        num += (v - loc) ** 2 * (one_minus ** 4)
+        den += one_minus * (1.0 - 5.0 * u * u)
+    den = abs(den)
+    if den <= 1e-12:
+        return loc, 0.0
+    scale_bi = math.sqrt(len(clean) * num) / den
+    return loc, float(max(scale_bi, 0.0))
+
+
 def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
     Great-circle distance between two points in miles.
@@ -944,6 +1030,63 @@ def _maybe_update_cadence_from_deltas(g_state: Dict[str, Any]) -> None:
             g_state.pop("cadence_mult", None)
 
 
+def _estimate_phase_offset_sec(g_state: Dict[str, Any]) -> float | None:
+    """
+    Estimate a stable phase offset for a snapped cadence.
+
+    We treat observation timestamps as lying on a grid of period
+    mean_interval_sec, and estimate the typical offset within that period.
+    Returns phase in seconds within [0, cadence).
+    """
+    mean_interval = g_state.get("mean_interval_sec")
+    if not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
+        return None
+    cadence = float(mean_interval)
+    cad_mult = g_state.get("cadence_mult")
+    if not isinstance(cad_mult, int) or cad_mult <= 0:
+        return None
+
+    history = g_state.get("history", []) or []
+    if not isinstance(history, list) or len(history) < 3:
+        return None
+
+    offsets: List[float] = []
+    seed: float | None = None
+    for entry in history[-HISTORY_LIMIT:]:
+        if not isinstance(entry, dict):
+            continue
+        ts_raw = entry.get("ts")
+        if not isinstance(ts_raw, str):
+            continue
+        dt = _parse_timestamp(ts_raw)
+        if dt is None:
+            continue
+        off = dt.timestamp() % cadence
+        if seed is None:
+            seed = off
+        # Unwrap to be near the seed.
+        if seed is not None:
+            if off - seed > cadence / 2:
+                off -= cadence
+            elif seed - off > cadence / 2:
+                off += cadence
+        offsets.append(off)
+
+    if not offsets or seed is None:
+        return None
+
+    # Robust location on unwrapped offsets.
+    loc, scale = tukey_biweight_location_scale(
+        offsets,
+        initial_loc=float(seed),
+        initial_scale=float(CADENCE_SNAP_TOL_SEC),
+    )
+    phase = float(loc % cadence)
+    g_state["phase_offset_sec"] = phase
+    g_state["phase_scale_sec"] = float(scale)
+    return phase
+
+
 class StateLockError(RuntimeError):
     pass
 
@@ -1086,6 +1229,22 @@ def _cleanup_state(state: Dict[str, Any]) -> None:
                 g_state["latencies_sec"] = clean_lat[-HISTORY_LIMIT:]
             else:
                 g_state.pop("latencies_sec", None)
+
+        # Initialize/normalize robust latency location/scale.
+        loc = g_state.get("latency_loc_sec")
+        scale = g_state.get("latency_scale_sec")
+        if not isinstance(loc, (int, float)) or loc < 0:
+            loc_old = g_state.get("latency_median_sec")
+            loc = float(loc_old) if isinstance(loc_old, (int, float)) and loc_old >= 0 else LATENCY_PRIOR_LOC_SEC
+        if not isinstance(scale, (int, float)) or scale < 0:
+            scale_old = g_state.get("latency_mad_sec")
+            scale = (
+                float(scale_old)
+                if isinstance(scale_old, (int, float)) and scale_old >= 0
+                else LATENCY_PRIOR_SCALE_SEC
+            )
+        g_state["latency_loc_sec"] = float(loc)
+        g_state["latency_scale_sec"] = float(scale)
 
         for key in ("latency_lower_sec", "latency_upper_sec"):
             vals = g_state.get(key)
@@ -1898,6 +2057,7 @@ def update_state_with_readings(
             if len(deltas) > HISTORY_LIMIT:
                 del deltas[0 : len(deltas) - HISTORY_LIMIT]
             _maybe_update_cadence_from_deltas(g_state)
+            _estimate_phase_offset_sec(g_state)
 
             # If we do not have a strong cadence multiple yet, ensure that a slow
             # gauge can still snap upward quickly from the prior.
@@ -1925,32 +2085,32 @@ def update_state_with_readings(
             if len(lat_u) > HISTORY_LIMIT:
                 del lat_u[0 : len(lat_u) - HISTORY_LIMIT]
 
-            # Use the midpoints as our primary latency samples.
-            midpoints = g_state.setdefault("latencies_sec", [])
-            mid = 0.5 * (lower + upper)
-            midpoints.append(mid)
-            if len(midpoints) > HISTORY_LIMIT:
-                del midpoints[0 : len(midpoints) - HISTORY_LIMIT]
+            # Primary latency samples.
+            samples = g_state.setdefault("latencies_sec", [])
+            prior_loc = g_state.get("latency_loc_sec")
+            if not isinstance(prior_loc, (int, float)) or prior_loc < 0:
+                prior_loc = g_state.get("latency_median_sec", LATENCY_PRIOR_LOC_SEC)
+            prior_scale = g_state.get("latency_scale_sec")
+            if not isinstance(prior_scale, (int, float)) or prior_scale <= 0:
+                prior_scale = g_state.get("latency_mad_sec", LATENCY_PRIOR_SCALE_SEC)
 
-            # Robust location/scale (median and MAD) on midpoints.
-            values = sorted(midpoints)
-            n = len(values)
-            if n:
-                if n % 2 == 1:
-                    median = values[n // 2]
-                else:
-                    median = 0.5 * (values[n // 2 - 1] + values[n // 2])
-                devs = [abs(v - median) for v in values]
-                devs.sort()
-                if devs:
-                    if n % 2 == 1:
-                        mad = devs[n // 2]
-                    else:
-                        mad = 0.5 * (devs[n // 2 - 1] + devs[n // 2])
-                else:
-                    mad = 0.0
-                g_state["latency_median_sec"] = median
-                g_state["latency_mad_sec"] = mad
+            # Most likely latency within the visibility window, informed by our prior.
+            sample = min(max(float(prior_loc), lower), upper)
+            samples.append(sample)
+            if len(samples) > HISTORY_LIMIT:
+                del samples[0 : len(samples) - HISTORY_LIMIT]
+
+            if len(samples) < 3:
+                loc = float(prior_loc)
+                scale = float(prior_scale)
+            else:
+                loc, scale = tukey_biweight_location_scale(
+                    samples,
+                    initial_loc=float(prior_loc),
+                    initial_scale=float(prior_scale),
+                )
+            g_state["latency_loc_sec"] = loc
+            g_state["latency_scale_sec"] = scale
 
             # Reset the consecutive no-update counter now that we saw a new point.
             g_state["no_update_polls"] = 0
@@ -1985,31 +2145,32 @@ def predict_gauge_next(state: Dict[str, Any], gauge_id: str, now: datetime) -> d
     # Clamp learned interval into the same sane bounds used elsewhere.
     mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
 
-    # Predict the next observation time.
-    delta_since_last = (now - last_ts).total_seconds()
-    if delta_since_last <= 0:
-        # We are viewing the world at or before the last observation timestamp;
-        # the next observation is one cadence step ahead.
-        next_obs = last_ts + timedelta(seconds=mean_interval)
-    elif delta_since_last <= 2 * mean_interval:
-        # We are within roughly one cadence interval of the last observation.
-        # Do not "skip" the next expected update just because we are slightly
-        # late relative to the nominal cadence; assume the immediate next
-        # observation is still pending.
-        next_obs = last_ts + timedelta(seconds=mean_interval)
+    cadence = float(mean_interval)
+
+    phase = g_state.get("phase_offset_sec")
+    if not isinstance(phase, (int, float)) or phase < 0 or phase >= cadence:
+        phase = _estimate_phase_offset_sec(g_state)
+
+    if isinstance(phase, (int, float)):
+        base_t = max(last_ts.timestamp(), now.timestamp())
+        k = math.floor((base_t - float(phase)) / cadence) + 1
+        next_obs_t = k * cadence + float(phase)
+        next_obs = datetime.fromtimestamp(next_obs_t, tz=timezone.utc)
     else:
-        # We are far beyond the last observation; assume we may have missed
-        # one or more intervals (e.g., the process was offline) and advance
-        # by enough whole intervals that the next prediction lies in the future.
-        multiples = max(1, math.ceil(delta_since_last / mean_interval))
-        next_obs = last_ts + timedelta(seconds=mean_interval * multiples)
+        # Fallback: predict relative to last observation.
+        delta_since_last = (now - last_ts).total_seconds()
+        if delta_since_last <= 0 or delta_since_last <= 2 * cadence:
+            next_obs = last_ts + timedelta(seconds=cadence)
+        else:
+            multiples = max(1, math.ceil(delta_since_last / cadence))
+            next_obs = last_ts + timedelta(seconds=cadence * multiples)
 
     # Add a robust latency estimate (time from observation to appearance in API).
-    latency_med = g_state.get("latency_median_sec", 0.0)
-    if not isinstance(latency_med, (int, float)) or latency_med < 0:
-        latency_med = 0.0
+    latency_loc = g_state.get("latency_loc_sec")
+    if not isinstance(latency_loc, (int, float)) or latency_loc < 0:
+        latency_loc = g_state.get("latency_median_sec", LATENCY_PRIOR_LOC_SEC)
 
-    return next_obs + timedelta(seconds=latency_med)
+    return next_obs + timedelta(seconds=float(latency_loc))
 
 
 def schedule_next_poll(
@@ -2048,16 +2209,18 @@ def schedule_next_poll(
         if next_api is None:
             continue
 
-        latency_mad = g_state.get("latency_mad_sec")
+        latency_scale = g_state.get("latency_scale_sec")
+        if not isinstance(latency_scale, (int, float)) or latency_scale < 0:
+            latency_scale = g_state.get("latency_mad_sec")
         fine_eligible = (
-            isinstance(latency_mad, (int, float))
-            and latency_mad > 0
-            and latency_mad <= FINE_LATENCY_MAD_MAX_SEC
+            isinstance(latency_scale, (int, float))
+            and latency_scale > 0
+            and latency_scale <= FINE_LATENCY_MAD_MAX_SEC
             and mean_interval <= 3600
         )
 
         if fine_eligible:
-            lat_width = max(FINE_WINDOW_MIN_SEC, 2.0 * float(latency_mad))
+            lat_width = max(FINE_WINDOW_MIN_SEC, 2.0 * float(latency_scale))
             fine_start = next_api - timedelta(seconds=lat_width)
             fine_end = next_api + timedelta(seconds=lat_width)
 
@@ -2118,20 +2281,24 @@ def control_summary(state: Dict[str, Any], now: datetime) -> str:
         mean_interval = g_state.get("mean_interval_sec")
         last_ts = _parse_timestamp(g_state.get("last_timestamp"))
         next_api = predict_gauge_next(state, gauge_id, now)
-        latency_med = g_state.get("latency_median_sec")
-        latency_mad = g_state.get("latency_mad_sec")
+        latency_loc = g_state.get("latency_loc_sec")
+        latency_scale = g_state.get("latency_scale_sec")
+        if not isinstance(latency_loc, (int, float)):
+            latency_loc = g_state.get("latency_median_sec")
+        if not isinstance(latency_scale, (int, float)):
+            latency_scale = g_state.get("latency_mad_sec")
         polls_ewma = g_state.get("polls_per_update_ewma")
         fine = (
-            isinstance(latency_mad, (int, float))
-            and latency_mad > 0
-            and latency_mad <= FINE_LATENCY_MAD_MAX_SEC
+            isinstance(latency_scale, (int, float))
+            and latency_scale > 0
+            and latency_scale <= FINE_LATENCY_MAD_MAX_SEC
             and isinstance(mean_interval, (int, float))
             and mean_interval <= 3600
         )
         mi_str = f"{int(mean_interval)}s" if isinstance(mean_interval, (int, float)) else "--"
         lat_str = (
-            f"{int(latency_med)}±{int(latency_mad)}s"
-            if isinstance(latency_med, (int, float)) and isinstance(latency_mad, (int, float))
+            f"{int(latency_loc)}±{int(latency_scale)}s"
+            if isinstance(latency_loc, (int, float)) and isinstance(latency_scale, (int, float))
             else "--"
         )
         next_str = _fmt_rel(now, next_api) if next_api else "unknown"
@@ -2457,12 +2624,16 @@ def draw_screen(
                         row_y += 1
 
                 # Latency stats.
-                latency_med = g_state.get("latency_median_sec")
-                latency_mad = g_state.get("latency_mad_sec")
-                if isinstance(latency_med, (int, float)) and row_y < max_y - 2:
-                    lm = int(round(latency_med))
-                    ls = int(round(latency_mad)) if isinstance(latency_mad, (int, float)) else 0
-                    lat_line = f"Latency (obs→API): median {lm}s, MAD {ls}s"
+                latency_loc = g_state.get("latency_loc_sec")
+                latency_scale = g_state.get("latency_scale_sec")
+                if not isinstance(latency_loc, (int, float)):
+                    latency_loc = g_state.get("latency_median_sec")
+                if not isinstance(latency_scale, (int, float)):
+                    latency_scale = g_state.get("latency_mad_sec")
+                if isinstance(latency_loc, (int, float)) and row_y < max_y - 2:
+                    lm = int(round(latency_loc))
+                    ls = int(round(latency_scale)) if isinstance(latency_scale, (int, float)) else 0
+                    lat_line = f"Latency (obs→API): {lm}±{ls}s"
                     stdscr.addstr(row_y, 0, lat_line[:max_x - 1], palette.get("dim", 0))
                     row_y += 1
 

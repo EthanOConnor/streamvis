@@ -365,7 +365,7 @@ def classify_status(gauge_id: str, stage_ft: float | None) -> str:
     return "NORMAL"
 
 
-def fetch_gauge_data() -> Dict[str, Dict[str, Any]]:
+def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str, Any]]:
     """
     Fetch latest stage (ft) and flow (cfs) for TANW1, GARW1, SQUW1, CRNW1
     from USGS Instantaneous Values service.
@@ -389,6 +389,10 @@ def fetch_gauge_data() -> Dict[str, Dict[str, Any]]:
         "parameterCd": "00060,00065",   # discharge, stage
         "siteStatus": "all",
     }
+    if state is not None:
+        ms = _compute_modified_since(state)
+        if ms:
+            params["modifiedSince"] = ms
 
     try:
         payload = get_json(USGS_IV_URL, params=params, timeout=5.0)
@@ -428,6 +432,27 @@ def fetch_gauge_data() -> Dict[str, Dict[str, Any]]:
         if obs_at and (current_obs is None or obs_at > current_obs):
             result[gauge_id]["observed_at"] = obs_at
 
+    # Backfill missing series from state so UI does not blank out.
+    if state is not None:
+        gauges_state = state.get("gauges", {})
+        if isinstance(gauges_state, dict):
+            for gauge_id, d in result.items():
+                g_state = gauges_state.get(gauge_id, {})
+                if not isinstance(g_state, dict):
+                    continue
+                if d.get("stage") is None:
+                    last_stage = g_state.get("last_stage")
+                    if isinstance(last_stage, (int, float)):
+                        d["stage"] = float(last_stage)
+                if d.get("flow") is None:
+                    last_flow = g_state.get("last_flow")
+                    if isinstance(last_flow, (int, float)):
+                        d["flow"] = float(last_flow)
+                if d.get("observed_at") is None:
+                    last_ts = _parse_timestamp(g_state.get("last_timestamp"))
+                    if last_ts is not None:
+                        d["observed_at"] = last_ts
+
     # Compute status strings based on stage thresholds
     for g, d in result.items():
         stage = d["stage"]
@@ -440,6 +465,54 @@ def _ewma(current_mean: float, new_value: float, alpha: float = EWMA_ALPHA) -> f
     if current_mean <= 0:
         return new_value
     return (1 - alpha) * current_mean + alpha * new_value
+
+
+def _iso8601_duration(seconds: float) -> str:
+    """
+    Render a positive duration as an ISO8601 'PT..H..M..S' string for USGS APIs.
+    """
+    total = int(max(0.0, float(seconds)))
+    if total <= 0:
+        return "PT0S"
+    minutes, sec_rem = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    parts: List[str] = []
+    if hours:
+        parts.append(f"{hours}H")
+    if minutes:
+        parts.append(f"{minutes}M")
+    if sec_rem and not parts:
+        parts.append(f"{sec_rem}S")
+    return "PT" + "".join(parts)
+
+
+def _compute_modified_since(state: Dict[str, Any]) -> str | None:
+    """
+    Compute a safe modifiedSince window for a batched IV request.
+
+    USGS IV `modifiedSince` is an ISO8601 duration, filtering to stations with
+    values that have changed within that recent window. We only enable it when
+    all tracked gauges are on <= 1 hour cadences; otherwise a narrow window could
+    suppress legitimate older updates for slow gauges.
+    """
+    gauges_state = state.get("gauges", {})
+    if not isinstance(gauges_state, dict):
+        return None
+    intervals: List[float] = []
+    for g_state in gauges_state.values():
+        if not isinstance(g_state, dict):
+            continue
+        mi = g_state.get("mean_interval_sec")
+        if isinstance(mi, (int, float)) and mi > 0:
+            intervals.append(float(mi))
+    if not intervals:
+        return None
+    max_interval = max(intervals)
+    min_interval = min(intervals)
+    if max_interval > 3600.0:
+        return None
+    window_sec = max(2.0 * min_interval, 30.0 * 60.0)
+    return _iso8601_duration(window_sec)
 
 
 def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -2648,7 +2721,7 @@ def tui_loop(args: argparse.Namespace) -> int:
             now = datetime.now(timezone.utc)
             if now >= next_poll_at:
                 state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
-                fetched = fetch_gauge_data()
+                fetched = fetch_gauge_data(state)
                 if fetched:
                     readings = fetched
                     retry_wait = args.min_retry_seconds
@@ -2840,7 +2913,7 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                 now = datetime.now(timezone.utc)
                 if now >= next_poll_at:
                     state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
-                    fetched = fetch_gauge_data()
+                    fetched = fetch_gauge_data(state)
                     if fetched:
                         readings = fetched
                         retry_wait = args.min_retry_seconds
@@ -2978,7 +3051,7 @@ def adaptive_loop(args: argparse.Namespace) -> int:
                     now = datetime.now(timezone.utc)
 
                 state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
-                readings = fetch_gauge_data()
+                readings = fetch_gauge_data(state)
                 if not readings:
                     time.sleep(min(args.max_retry_seconds, retry_wait))
                     retry_wait = min(args.max_retry_seconds, retry_wait * 2)
@@ -3138,7 +3211,7 @@ def main(argv: list[str] | None = None) -> int:
             maybe_backfill_state(state, args.backfill_hours)
             save_state(state_path, state)
 
-            data = fetch_gauge_data()
+            data = fetch_gauge_data(state)
             if not data:
                 print("No data available from USGS Instantaneous Values service.", file=sys.stderr)
                 return 1

@@ -268,6 +268,11 @@ Design vs implementation:
 - **Dynamic ID collisions**: Dynamic gauges are assigned short `Uxxxxx` ids from site number suffix; collisions are unlikely but handled by numeric fallback. If users enable Nearby in dense areas, main table may grow beyond the original Snoqualmie focus.
 - **Rate/politeness**: Discovery is gated to at most once per 24h per state file, and only on Nearby enable or first location availability.
 
+## 2025-12-12 – `modifiedSince` optimization scrutiny
+
+- **Semantics**: `modifiedSince` on IV is a *duration*, not an absolute timestamp, and filters out stations with no changes in that window. We gate usage to fast‑cadence‑only sessions to avoid missing slow‑gauge updates. citeturn0search0turn0search1
+- **UX risk**: When `modifiedSince` suppresses a station, IV omits its time series entirely. We now backfill display values from state and still count a no‑update poll by setting `observed_at` to the last stored timestamp.
+
 ## 2025-12-10 – Meta scrutinizer refinement
 
 - **Critical – TUI trend crash when stages are absent** (`streamvis.py:1219`–`1225`): `dh` is only set when stage data exists, yet the flow trend divides by `dh` regardless. A flow-only gauge would raise `UnboundLocalError`. Seed `dh` from the time span of the flow samples (or default to `1.0`) before either trend calculation.

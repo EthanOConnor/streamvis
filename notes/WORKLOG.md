@@ -161,3 +161,8 @@
 ## 2025-12-11 – Dynamic Nearby discovery
 
 - Extended Nearby mode to query the USGS NWIS Site Service for active IV stream gauges near the user, select the 3 closest, and add/persist them as dynamic stations (`Uxxxxx` ids) when not already tracked.
+
+## 2025-12-12 – USGS `modifiedSince` optimization
+
+- Added an opportunistic `modifiedSince` duration filter to USGS IV fetches when all tracked gauges have ≤1h cadences, reducing payload by omitting unchanged stations without risking missed updates on slow gauges.
+- `fetch_gauge_data(state)` now backfills omitted series from persisted state so the UI remains stable while still counting “no‑update” polls correctly.

@@ -162,6 +162,23 @@ class SchedulerTests(unittest.TestCase):
         gid1 = sv._dynamic_gauge_id("12345678", ["U5678", "U56781"])  # type: ignore[attr-defined]
         self.assertTrue(gid1.startswith("U"))
 
+    def test_iso8601_duration(self) -> None:
+        self.assertEqual(sv._iso8601_duration(30), "PT30S")  # type: ignore[attr-defined]
+        self.assertEqual(sv._iso8601_duration(1800), "PT30M")  # type: ignore[attr-defined]
+        self.assertEqual(sv._iso8601_duration(5400), "PT1H30M")  # type: ignore[attr-defined]
+
+    def test_compute_modified_since_gating(self) -> None:
+        state = {
+            "gauges": {
+                "A": {"mean_interval_sec": 900},
+                "B": {"mean_interval_sec": 1800},
+            }
+        }
+        ms = sv._compute_modified_since(state)  # type: ignore[attr-defined]
+        self.assertEqual(ms, "PT30M")
+        slow_state = {"gauges": {"A": {"mean_interval_sec": 7200}}}
+        self.assertIsNone(sv._compute_modified_since(slow_state))  # type: ignore[attr-defined]
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -173,3 +173,10 @@
 - **Data**:
   - Maintain built‑in decimal lat/lon defaults for core Snoqualmie gauges (and CONW1) and allow per‑station override via `config.toml` `lat`/`lon`.
   - When Nearby is enabled and a location is available, dynamically discover the three nearest active USGS IV stream stations via the NWIS Site Service (`/nwis/site/` RDB), add them to `SITE_MAP`/state as needed using a short `Uxxxxx` gauge id, and persist them under `meta.dynamic_sites` / `meta.nearby_gauges` so they survive reloads.
+
+## 2025-12-12 – IV `modifiedSince` filter
+
+- **USGS IV conditional fetching**:
+  - The WaterServices IV endpoint supports a `modifiedSince` parameter as an ISO‑8601 duration (e.g., `PT30M`) that returns time series only for stations whose values changed within that recent window. citeturn0search0turn0search1
+  - Decision: when all tracked gauges have learned cadences ≤1 hour, include a narrow `modifiedSince` window (max(2×min cadence, 30 min)) to omit unchanged stations and reduce bandwidth on early/no‑update polls. If any gauge is slower than 1 hour, omit `modifiedSince` to avoid suppressing older-but-new-to-us updates.
+  - UX safeguard: `fetch_gauge_data(state)` fills any omitted station rows from persisted `last_*` values so the main table doesn’t go blank, and it sets `observed_at` to the last known timestamp so no‑update polls are still counted for politeness metrics.

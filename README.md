@@ -51,6 +51,7 @@ Behavior:
 - Fetches once immediately, then learns the typical update cadence per gauge (EWMA of observed intervals) starting from a strong 15‑minute‑multiple prior (15/30/60 min, etc.) and snapping to the best‑fitting multiple once enough intervals are observed or backfilled.
 - Schedules the next multi-gauge request just before the next expected update (shared single call for all gauges).
 - If the prediction was early (no new timestamps), it widens the interval slightly and does a short retry (default 60s) so it converges toward ~1 call per new update.
+- When all tracked gauges are on ≤1h cadences, it includes USGS IV `modifiedSince` (duration) to omit unchanged stations and reduce payload on early polls.
 - Persisted state lives at `~/.streamvis_state.json` (override with `--state-file PATH`). Only the last timestamps, learned intervals, and last values are stored—no heavy history. A single-writer lock prevents two `streamvis` instances from using the same state file concurrently; start a second instance with a different `--state-file` if needed.
 - Learning has sensible floors/ceilings: sub-60-second deltas are ignored when learning cadence, and learned intervals are clamped to a reasonable range before scheduling the next fetch.
 - About every 6 hours, `streamvis` re-fetches a small recent history window to detect missed updates or cadence shifts and re-align the learner without adding noticeable load.

@@ -192,4 +192,19 @@
   - Each latency sample is chosen as the most‑likely value within the last‑poll/this‑poll visibility window by clamping the current prior location into `[lower, upper]`.
 - **Phase estimation**:
   - When a gauge locks onto a 15‑minute multiple cadence (`cadence_mult`), estimate its typical phase offset within that cadence from recent observation timestamps using a robust biweight location on unwrapped modulo offsets.
-  - Prediction uses the next grid time after `max(last_ts, now)`.
+- Prediction uses the next grid time after `max(last_ts, now)`.
+
+## 2025-12-12 – Community priors + browser state flush
+
+- **Browser persistence**:
+  - Decision: sync the active state file to browser `localStorage` on every `save_state()` when running under Pyodide.
+  - Rationale: the JS harness only guaranteed syncing on clean shutdown; mobile reloads or tab crashes were discarding learned cadence/latency. Per‑save flushing keeps behavior consistent with native runs.
+  - Trade‑off: a small extra `localStorage.setItem` per poll, which is negligible at the tool’s polling cadence.
+
+- **Community priors service (optional)**:
+  - Decision: add two CLI flags:
+    - `--community-base`: base URL for a shared summary (`GET {base}/summary.json`).
+    - `--community-publish`: enable native per‑update sample contributions (`POST {base}/sample`).
+  - Seeding rule: remote priors are adopted only when local confidence is low (no/weak `cadence_mult`, missing `phase_offset_sec`, or <3 latency samples) so local learning remains authoritative after a short warm‑up.
+  - Publishing rule: contribute once per real observation advance, carrying the observation timestamp, poll timestamp, and latency window + best sample. Web clients do not publish yet (no synchronous POST path), but still read priors.
+  - Rationale: enables low‑latency cold starts and faster convergence across many clients without requiring a central operator or heavy infra.

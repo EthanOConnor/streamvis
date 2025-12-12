@@ -72,6 +72,8 @@ Options:
 - `--min-retry-seconds` (default 60): retry delay if the prediction was early.
 - `--max-retry-seconds` (default 300): ceiling when backing off on errors.
 - `--backfill-hours` (default 6): on startup, backfill this many hours of recent history from USGS IV to seed the cadence learner and charts (0 disables).
+- `--community-base URL`: optional base URL for shared “community” priors. If set, `streamvis` fetches `{URL}/summary.json` at most once per day to seed cold starts with observed cadence/latency for each station.
+- `--community-publish`: when used with `--community-base`, publish per‑update latency samples to `{URL}/sample` (native CLI only).
 - `--user-lat` / `--user-lon`: optional manual location for the Nearby gauges section in native TUI mode.
 - Nearby mode (`n` in TUI): when enabled and a location is available, `streamvis` queries the USGS Site Service for active IV stream gauges near you, adds the three closest to the session/state if they aren’t already tracked, and shows them in a small “Closest stations” panel.
 - `--ui-tick-sec` (default 0.15): UI refresh tick in TUI mode; raise this on slow devices/browsers to reduce CPU.
@@ -173,7 +175,7 @@ Note: TUI mode uses Python `curses` (available on macOS/Linux; Windows users may
 - The core logic in `streamvis.py` is unchanged; only HTTP and curses are abstracted behind `http_client.py` and `web_curses.py`.
 - In the browser, HTTP calls use `pyodide.http.open_url`, so requests go directly from the page to USGS/NWPS/NWRFC with CORS.
 - The TUI draws into a `<div id="terminal">` using `web_curses`, and key events (`q`, arrows, `c`, `r`, `f`, `Enter`) are forwarded from JS into `getch()`.
-- State is persisted between browser sessions by mapping the `--state-file streamvis_state.json` used by the web entrypoint to `localStorage` (`streamvis_state_json`).
+- State is persisted between browser sessions by mapping the `--state-file streamvis_state.json` used by the web entrypoint to `localStorage` (`streamvis_state_json`) and syncing it on every save, so even a mid‑run reload retains learned cadence/latency.
 - The browser shim adapts the virtual terminal size to the viewport and lets you tap/click on a station row to select it and toggle its detail/table view, which works well on devices like an iPhone in landscape mode.
 
 To host this on GitHub Pages:

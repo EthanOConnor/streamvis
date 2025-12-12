@@ -344,3 +344,11 @@ Design vs implementation:
 - **Risk – synchronous TUI loop blocks Safari**: running the native `tui_loop` inside Pyodide on the main thread can starve the JS event loop, leading to black screens and tab hangs on iOS.
   - Resolution: added `web_tui_main()` using `asyncio` to yield every UI tick, and switched the browser entrypoint to use it.
   - Residual check: if future features add long synchronous work per tick, re‑audit that the async loop still yields frequently.
+
+## 2025-12-12 – Community priors + localStorage flush risks
+
+- **Medium – Browser localStorage quota / perf**: syncing state to `localStorage` on every `save_state()` increases write frequency vs “only on clean exit.” If the state grows (e.g., more dynamic sites or long forecast histories), Safari may hit a storage quota and throw. Resolution: writes are wrapped in try/except so runtime is unaffected; if this becomes real, consider trimming dynamic‑site history or compressing JSON before storage.
+
+- **Medium – Remote priors trust / staleness**: community summaries could be stale, biased, or malicious. Resolution: client only adopts priors when local confidence is low (<3 latency samples or weak cadence snap), so local learning quickly dominates; still, UI could optionally label “seeded from community” vs “learned locally” later.
+
+- **Low – Publishing failure visibility**: native clients ignore POST failures by design; operators might not realize publishing is ineffective. Resolution: acceptable for now; a future `--debug` log line could emit last publish success/failure timestamps without changing default UX.

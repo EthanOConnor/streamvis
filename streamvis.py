@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from http_client import get_json, get_text
+from http_client import get_json, get_text, post_json
 
 try:
     import fcntl  # type: ignore[import]
@@ -1172,6 +1172,20 @@ def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2, sort_keys=True)
     tmp_path.replace(state_path)
+    # In browser/Pyodide builds, keep localStorage in sync on every save so a
+    # reload mid-run does not discard learned cadence/latency state.
+    try:
+        import js  # type: ignore[import]
+    except Exception:
+        js = None  # type: ignore[assignment]
+    if js is not None:
+        try:
+            js.window.localStorage.setItem(
+                "streamvis_state_json",
+                json.dumps(state, sort_keys=True),
+            )
+        except Exception:
+            pass
 
 
 def _cleanup_state(state: Dict[str, Any]) -> None:
@@ -1939,6 +1953,158 @@ def maybe_refresh_nwrfc(state: Dict[str, Any], args: argparse.Namespace) -> None
     meta["last_nwrfc_fetch"] = now.isoformat()
 
 
+def maybe_refresh_community(state: Dict[str, Any], args: argparse.Namespace) -> None:
+    """
+    Optionally refresh shared cadence/latency priors from a community endpoint.
+
+    If `--community-base` is provided, we fetch `{base}/summary.json` (or the URL
+    directly if it already ends with `.json`) at most once per 24h and use it to
+    seed gauges that have low confidence / few samples.
+
+    This is a soft dependency: failures are ignored.
+    """
+    base = getattr(args, "community_base", "")
+    if not isinstance(base, str) or not base:
+        return
+
+    now = datetime.now(timezone.utc)
+    meta = state.setdefault("meta", {})
+    last_fetch_raw = meta.get("last_community_fetch")
+    last_fetch = _parse_timestamp(last_fetch_raw) if isinstance(last_fetch_raw, str) else None
+    if last_fetch is not None:
+        age_sec = (now - last_fetch).total_seconds()
+        if age_sec < 24 * 3600:
+            return
+
+    base_clean = base.rstrip("/")
+    if base_clean.endswith(".json"):
+        url = base_clean
+    else:
+        url = f"{base_clean}/summary.json"
+
+    try:
+        summary = get_json(url, timeout=5.0)
+    except Exception:
+        return
+    if not isinstance(summary, dict):
+        return
+
+    stations = summary.get("stations") or summary.get("gauges") or summary.get("sites")
+    if not isinstance(stations, dict):
+        return
+
+    gauges_state = state.setdefault("gauges", {})
+    for gauge_id, site_no in SITE_MAP.items():
+        if not isinstance(site_no, str) or not site_no:
+            continue
+        remote = stations.get(site_no)
+        if not isinstance(remote, dict):
+            remote = stations.get(gauge_id) if isinstance(gauge_id, str) else None
+        if not isinstance(remote, dict):
+            continue
+
+        g_state = gauges_state.setdefault(gauge_id, {})
+
+        # Cadence multiple + fit: only adopt if we don't have a confident snap yet.
+        local_mult = g_state.get("cadence_mult")
+        local_fit = g_state.get("cadence_fit")
+        remote_mult = remote.get("cadence_mult")
+        remote_fit = remote.get("cadence_fit")
+        low_confidence = (
+            not isinstance(local_mult, int)
+            or not isinstance(local_fit, (int, float))
+            or float(local_fit) < CADENCE_FIT_THRESHOLD
+        )
+        if low_confidence and isinstance(remote_mult, int) and remote_mult > 0:
+            g_state["cadence_mult"] = int(remote_mult)
+            if isinstance(remote_fit, (int, float)):
+                g_state["cadence_fit"] = float(remote_fit)
+            if "mean_interval_sec" not in g_state:
+                g_state["mean_interval_sec"] = float(remote_mult * CADENCE_BASE_SEC)
+
+        # Phase offset: only seed if not learned locally.
+        local_phase = g_state.get("phase_offset_sec")
+        remote_phase = remote.get("phase_offset_sec")
+        if not isinstance(local_phase, (int, float)) and isinstance(remote_phase, (int, float)):
+            cadence = g_state.get("mean_interval_sec")
+            if isinstance(cadence, (int, float)) and cadence > 0:
+                g_state["phase_offset_sec"] = float(remote_phase) % float(cadence)
+
+        # Latency priors: only seed if we have very few samples locally.
+        local_samples = g_state.get("latencies_sec")
+        if not isinstance(local_samples, list) or len(local_samples) < 3:
+            remote_loc = remote.get("latency_loc_sec") or remote.get("latency_median_sec")
+            remote_scale = remote.get("latency_scale_sec") or remote.get("latency_mad_sec")
+            if isinstance(remote_loc, (int, float)) and float(remote_loc) >= 0:
+                g_state["latency_loc_sec"] = float(remote_loc)
+            if isinstance(remote_scale, (int, float)) and float(remote_scale) > 0:
+                g_state["latency_scale_sec"] = float(remote_scale)
+
+    meta["last_community_fetch"] = now.isoformat()
+
+
+def maybe_publish_community_samples(
+    state: Dict[str, Any],
+    args: argparse.Namespace,
+    updates: Dict[str, bool],
+    poll_ts: datetime,
+) -> None:
+    """
+    Optionally publish observed update/latency samples to a community endpoint.
+
+    Enabled via `--community-base` + `--community-publish`. Uses POST
+    `{base}/sample`. Soft failures are ignored. Under Pyodide this is a no-op.
+    """
+    base = getattr(args, "community_base", "")
+    publish = bool(getattr(args, "community_publish", False))
+    if not publish or not isinstance(base, str) or not base:
+        return
+
+    base_clean = base.rstrip("/")
+    if base_clean.endswith(".json") and "/" in base_clean:
+        base_clean = base_clean.rsplit("/", 1)[0]
+    url = f"{base_clean}/sample"
+
+    gauges_state = state.get("gauges", {})
+    if not isinstance(gauges_state, dict):
+        return
+
+    for gauge_id, did_update in updates.items():
+        if not did_update:
+            continue
+        g_state = gauges_state.get(gauge_id)
+        if not isinstance(g_state, dict):
+            continue
+        site_no = SITE_MAP.get(gauge_id)
+        if not isinstance(site_no, str) or not site_no:
+            continue
+        obs_ts = g_state.get("last_timestamp")
+        if not isinstance(obs_ts, str):
+            continue
+        lower = g_state.get("last_latency_lower_sec")
+        upper = g_state.get("last_latency_upper_sec")
+        sample = g_state.get("last_latency_sample_sec")
+        if not isinstance(lower, (int, float)) or not isinstance(upper, (int, float)):
+            continue
+        if not isinstance(sample, (int, float)):
+            continue
+
+        payload = {
+            "version": 1,
+            "site_no": site_no,
+            "gauge_id": gauge_id,
+            "obs_ts": obs_ts,
+            "poll_ts": poll_ts.isoformat(),
+            "lower_sec": float(lower),
+            "upper_sec": float(upper),
+            "latency_sec": float(sample),
+        }
+        try:
+            post_json(url, payload, timeout=5.0)
+        except Exception:
+            continue
+
+
 def update_state_with_readings(
     state: Dict[str, Any],
     readings: Dict[str, Dict[str, Any]],
@@ -2097,6 +2263,10 @@ def update_state_with_readings(
             # Most likely latency within the visibility window, informed by our prior.
             sample = min(max(float(prior_loc), lower), upper)
             samples.append(sample)
+            # Persist the latest window/sample for optional community publishing.
+            g_state["last_latency_lower_sec"] = float(lower)
+            g_state["last_latency_upper_sec"] = float(upper)
+            g_state["last_latency_sample_sec"] = float(sample)
             if len(samples) > HISTORY_LIMIT:
                 del samples[0 : len(samples) - HISTORY_LIMIT]
 
@@ -2886,6 +3056,7 @@ def tui_loop(args: argparse.Namespace) -> int:
         state = load_state(state_path)
         apply_dynamic_sites_from_state(state)
         maybe_backfill_state(state, args.backfill_hours)
+        maybe_refresh_community(state, args)
         seed_user_location_from_args(state, args)
         gauges = ordered_gauges()
         save_state(state_path, state)
@@ -2901,6 +3072,7 @@ def tui_loop(args: argparse.Namespace) -> int:
         while True:
             now = datetime.now(timezone.utc)
             if now >= next_poll_at:
+                maybe_refresh_community(state, args)
                 state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
                 fetched = fetch_gauge_data(state)
                 if fetched:
@@ -2911,6 +3083,7 @@ def tui_loop(args: argparse.Namespace) -> int:
                         maybe_periodic_backfill_check(state, now)
                     maybe_refresh_forecasts(state, args)
                     maybe_refresh_nwrfc(state, args)
+                    maybe_publish_community_samples(state, args, updates, now)
                     save_state(state_path, state)
                     next_poll_at = schedule_next_poll(
                         state,
@@ -3074,6 +3247,7 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
             state = load_state(state_path)
             apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
+            maybe_refresh_community(state, args)
             seed_user_location_from_args(state, args)
             gauges = ordered_gauges()
             save_state(state_path, state)
@@ -3093,6 +3267,7 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
             while True:
                 now = datetime.now(timezone.utc)
                 if now >= next_poll_at:
+                    maybe_refresh_community(state, args)
                     state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
                     fetched = fetch_gauge_data(state)
                     if fetched:
@@ -3101,6 +3276,7 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                         updates = update_state_with_readings(state, readings, poll_ts=now)
                         maybe_refresh_forecasts(state, args)
                         maybe_refresh_nwrfc(state, args)
+                        maybe_publish_community_samples(state, args, updates, now)
                         save_state(state_path, state)
                         next_poll_at = schedule_next_poll(
                             state,
@@ -3219,6 +3395,7 @@ def adaptive_loop(args: argparse.Namespace) -> int:
             state = load_state(state_path)
             apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
+            maybe_refresh_community(state, args)
             save_state(state_path, state)
             retry_wait = args.min_retry_seconds
             next_poll_at: datetime | None = None
@@ -3231,6 +3408,7 @@ def adaptive_loop(args: argparse.Namespace) -> int:
                         time.sleep(sleep_for)
                     now = datetime.now(timezone.utc)
 
+                maybe_refresh_community(state, args)
                 state.setdefault("meta", {})["last_fetch_at"] = now.isoformat()
                 readings = fetch_gauge_data(state)
                 if not readings:
@@ -3247,6 +3425,7 @@ def adaptive_loop(args: argparse.Namespace) -> int:
                 if getattr(args, "backfill_hours", DEFAULT_BACKFILL_HOURS) > 0:
                     maybe_periodic_backfill_check(state, now)
                 maybe_refresh_forecasts(state, args)
+                maybe_publish_community_samples(state, args, updates, now)
                 save_state(state_path, state)
 
                 if next_poll_at is None or any(updates.values()):
@@ -3334,6 +3513,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--community-base",
+        default="",
+        help=(
+            "Optional base URL for shared cadence/latency priors. "
+            "If set, streamvis will GET {base}/summary.json at most once per day."
+        ),
+    )
+    parser.add_argument(
+        "--community-publish",
+        action="store_true",
+        help="Publish observed update/latency samples to {community-base}/sample (native only).",
+    )
+    parser.add_argument(
         "--user-lat",
         type=float,
         default=None,
@@ -3390,6 +3582,7 @@ def main(argv: list[str] | None = None) -> int:
             state = load_state(state_path)
             apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
+            maybe_refresh_community(state, args)
             save_state(state_path, state)
 
             data = fetch_gauge_data(state)
@@ -3397,9 +3590,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("No data available from USGS Instantaneous Values service.", file=sys.stderr)
                 return 1
 
-            update_state_with_readings(state, data, poll_ts=datetime.now(timezone.utc))
+            now = datetime.now(timezone.utc)
+            updates = update_state_with_readings(state, data, poll_ts=now)
             maybe_refresh_forecasts(state, args)
             maybe_refresh_nwrfc(state, args)
+            maybe_publish_community_samples(state, args, updates, now)
             save_state(state_path, state)
             if getattr(args, "debug", False):
                 try:

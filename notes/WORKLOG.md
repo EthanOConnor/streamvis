@@ -175,3 +175,9 @@
 ## 2025-12-12 – Latency visibility in compact detail
 
 - Surfaced per‑gauge latency location/scale (`latency_loc_sec ± latency_scale_sec`) in the always‑visible station detail timing line, not just expanded detail mode.
+
+## 2025-12-12 – Browser persistence + community priors
+
+- Synced `streamvis_state.json` to browser `localStorage` on every `save_state()` so mid‑run reloads keep learned cadence/latency.
+- Added optional community read/publish hooks (`--community-base`, `--community-publish`) to seed cold starts from shared priors and contribute per‑update latency samples (native only).
+- Documented the community aggregator contract in `notes/COMMUNITY_AGGREGATOR.md` and added a minimal Cloudflare Worker example in `serverless/community_worker.js`.

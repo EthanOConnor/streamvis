@@ -10,6 +10,7 @@ Thin HTTP abstraction so streamvis can run under:
 Public API:
     get_json(url, params=None, timeout=10.0) -> Any
     get_text(url, params=None, timeout=10.0) -> str
+    post_json(url, data=None, timeout=10.0) -> Any
 """
 
 import json
@@ -93,3 +94,33 @@ def get_json(
 
     text = get_text(url, params=params, timeout=timeout)
     return json.loads(text)
+
+
+def post_json(
+    url: str,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+) -> Any:
+    """
+    POST a JSON payload and return parsed JSON (or text) response.
+
+    In CPython:
+        - Uses requests.post(..., json=data, timeout=timeout)
+        - Raises on non-2xx status
+
+    In Pyodide:
+        - Not currently supported (no synchronous POST path); callers should
+          treat exceptions as soft failures.
+    """
+    if _USE_PYODIDE:
+        raise RuntimeError("post_json is not supported under Pyodide")
+    if requests is None:  # pragma: no cover
+        raise RuntimeError(
+            "requests is required for native HTTP; install streamvis with pip to pull it in."
+        ) from _REQUESTS_IMPORT_ERROR
+    resp = requests.post(url, json=data or {}, timeout=timeout)  # type: ignore[name-defined]
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text

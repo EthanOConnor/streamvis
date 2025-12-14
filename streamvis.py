@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from http_client import get_json, get_text, post_json
+from http_client import get_json, get_text, post_json, post_json_async
 
 try:
     import fcntl  # type: ignore[import]
@@ -1163,6 +1163,66 @@ def load_state(state_path: Path) -> Dict[str, Any]:
     return state
 
 
+def _slim_state_for_browser(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a smaller persistence-friendly subset of state for browser localStorage.
+
+    This is used only as a fallback when a full JSON write exceeds localStorage
+    quotas (notably on iOS Safari). It prioritizes keeping cadence/latency
+    learning and the latest readings, while dropping bulky forecast overlays and
+    trimming histories.
+    """
+    slim: Dict[str, Any] = {"gauges": {}, "meta": {}}
+    meta = state.get("meta")
+    if isinstance(meta, dict):
+        slim["meta"] = dict(meta)
+
+    gauges_state = state.get("gauges", {})
+    if not isinstance(gauges_state, dict):
+        return slim
+
+    keep_scalar_keys = (
+        "last_timestamp",
+        "last_poll_ts",
+        "last_stage",
+        "last_flow",
+        "mean_interval_sec",
+        "cadence_mult",
+        "cadence_fit",
+        "phase_offset_sec",
+        "latency_loc_sec",
+        "latency_scale_sec",
+        "polls_per_update_ewma",
+        "last_polls_per_update",
+        "no_update_polls",
+    )
+    keep_series_keys = (
+        "history",
+        "deltas",
+        "latencies_sec",
+        "latency_lower_sec",
+        "latency_upper_sec",
+    )
+    series_limit = 60
+
+    out_gauges: Dict[str, Any] = {}
+    for gauge_id, g_state in gauges_state.items():
+        if not isinstance(gauge_id, str) or not isinstance(g_state, dict):
+            continue
+        out: Dict[str, Any] = {}
+        for key in keep_scalar_keys:
+            if key in g_state:
+                out[key] = g_state[key]
+        for key in keep_series_keys:
+            vals = g_state.get(key)
+            if isinstance(vals, list) and vals:
+                out[key] = vals[-series_limit:]
+        out_gauges[gauge_id] = out
+
+    slim["gauges"] = out_gauges
+    return slim
+
+
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     meta = state.setdefault("meta", {})
@@ -1179,13 +1239,20 @@ def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     except Exception:
         js = None  # type: ignore[assignment]
     if js is not None:
+        serialized = json.dumps(state, separators=(",", ":"), sort_keys=True)
         try:
-            js.window.localStorage.setItem(
-                "streamvis_state_json",
-                json.dumps(state, sort_keys=True),
-            )
+            js.window.localStorage.setItem("streamvis_state_json", serialized)
         except Exception:
-            pass
+            # If iOS/Safari quota is tight, fall back to a slimmed state that
+            # preserves cadence/latency learning but drops bulky overlays.
+            try:
+                slim = _slim_state_for_browser(state)
+                js.window.localStorage.setItem(
+                    "streamvis_state_json",
+                    json.dumps(slim, separators=(",", ":"), sort_keys=True),
+                )
+            except Exception:
+                pass
 
 
 def _cleanup_state(state: Dict[str, Any]) -> None:
@@ -2103,6 +2170,95 @@ def maybe_publish_community_samples(
             post_json(url, payload, timeout=5.0)
         except Exception:
             continue
+
+
+_WEB_COMMUNITY_QUEUE: List[Dict[str, Any]] = []
+_WEB_COMMUNITY_DRAIN_TASK: Any | None = None
+
+
+async def _drain_web_community_queue(url: str) -> None:
+    import asyncio
+
+    while _WEB_COMMUNITY_QUEUE:
+        payload = _WEB_COMMUNITY_QUEUE.pop(0)
+        try:
+            await post_json_async(url, payload, timeout=5.0)
+        except Exception:
+            pass
+        await asyncio.sleep(0)
+
+
+async def maybe_publish_community_samples_async(
+    state: Dict[str, Any],
+    args: argparse.Namespace,
+    updates: Dict[str, bool],
+    poll_ts: datetime,
+) -> None:
+    """
+    Async publisher for Pyodide/web builds.
+
+    Mirrors `maybe_publish_community_samples`, but uses async fetch under Pyodide
+    and avoids blocking the UI tick by enqueueing and draining in the background.
+    """
+    base = getattr(args, "community_base", "")
+    publish = bool(getattr(args, "community_publish", False))
+    if not publish or not isinstance(base, str) or not base:
+        return
+
+    base_clean = base.rstrip("/")
+    if base_clean.endswith(".json") and "/" in base_clean:
+        base_clean = base_clean.rsplit("/", 1)[0]
+    url = f"{base_clean}/sample"
+
+    gauges_state = state.get("gauges", {})
+    if not isinstance(gauges_state, dict):
+        return
+
+    batch: List[Dict[str, Any]] = []
+    for gauge_id, did_update in updates.items():
+        if not did_update:
+            continue
+        g_state = gauges_state.get(gauge_id)
+        if not isinstance(g_state, dict):
+            continue
+        site_no = SITE_MAP.get(gauge_id)
+        if not isinstance(site_no, str) or not site_no:
+            continue
+        obs_ts = g_state.get("last_timestamp")
+        if not isinstance(obs_ts, str):
+            continue
+        lower = g_state.get("last_latency_lower_sec")
+        upper = g_state.get("last_latency_upper_sec")
+        sample = g_state.get("last_latency_sample_sec")
+        if not isinstance(lower, (int, float)) or not isinstance(upper, (int, float)):
+            continue
+        if not isinstance(sample, (int, float)):
+            continue
+        batch.append(
+            {
+                "version": 1,
+                "site_no": site_no,
+                "gauge_id": gauge_id,
+                "obs_ts": obs_ts,
+                "poll_ts": poll_ts.isoformat(),
+                "lower_sec": float(lower),
+                "upper_sec": float(upper),
+                "latency_sec": float(sample),
+            }
+        )
+
+    if not batch:
+        return
+
+    global _WEB_COMMUNITY_DRAIN_TASK
+    _WEB_COMMUNITY_QUEUE.extend(batch)
+    if len(_WEB_COMMUNITY_QUEUE) > 50:
+        del _WEB_COMMUNITY_QUEUE[0 : len(_WEB_COMMUNITY_QUEUE) - 50]
+
+    if _WEB_COMMUNITY_DRAIN_TASK is None or _WEB_COMMUNITY_DRAIN_TASK.done():
+        import asyncio
+
+        _WEB_COMMUNITY_DRAIN_TASK = asyncio.create_task(_drain_web_community_queue(url))
 
 
 def update_state_with_readings(
@@ -3276,7 +3432,7 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                         updates = update_state_with_readings(state, readings, poll_ts=now)
                         maybe_refresh_forecasts(state, args)
                         maybe_refresh_nwrfc(state, args)
-                        maybe_publish_community_samples(state, args, updates, now)
+                        await maybe_publish_community_samples_async(state, args, updates, now)
                         save_state(state_path, state)
                         next_poll_at = schedule_next_poll(
                             state,

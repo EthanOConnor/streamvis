@@ -14,6 +14,33 @@ from typing import List
 from streamvis import main, web_tui_main
 
 
+def _append_community_args(argv: List[str]) -> None:
+    try:
+        import js  # type: ignore[import]
+    except Exception:
+        return
+
+    base = ""
+    publish = False
+    try:
+        base_raw = js.window.streamvisCommunityBase
+        if base_raw is not None:
+            base = str(base_raw)
+    except Exception:
+        base = ""
+    try:
+        publish = bool(js.window.streamvisCommunityPublish)
+    except Exception:
+        publish = False
+
+    if not base or base == "undefined":
+        return
+
+    argv.extend(["--community-base", base])
+    if publish:
+        argv.append("--community-publish")
+
+
 def run_default() -> int:
     """
     Run streamvis in TUI mode using a local state file that is easy to
@@ -29,6 +56,7 @@ def run_default() -> int:
         "--ui-tick-sec",
         "0.25",
     ]
+    _append_community_args(argv)
     return main(argv)
 
 
@@ -46,6 +74,7 @@ async def run_default_async() -> int:
         "--ui-tick-sec",
         "0.25",
     ]
+    _append_community_args(argv)
     return await web_tui_main(argv)
 
 

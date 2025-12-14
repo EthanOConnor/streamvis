@@ -352,3 +352,11 @@ Design vs implementation:
 - **Medium – Remote priors trust / staleness**: community summaries could be stale, biased, or malicious. Resolution: client only adopts priors when local confidence is low (<3 latency samples or weak cadence snap), so local learning quickly dominates; still, UI could optionally label “seeded from community” vs “learned locally” later.
 
 - **Low – Publishing failure visibility**: native clients ignore POST failures by design; operators might not realize publishing is ineffective. Resolution: acceptable for now; a future `--debug` log line could emit last publish success/failure timestamps without changing default UX.
+
+## 2025-12-14 – Web publishing and quota fallback follow-ups
+
+- **Medium – localStorage quota now mitigated, but not eliminated**: browser persistence now falls back to a slim state if a full write fails, which should preserve cadence/latency learning. Residual risk: even the slim state could exceed quota in extreme cases (many dynamic sites). Mitigation: we silently keep running; future work could evict least-recently-used dynamic gauges from the persisted state.
+
+- **Low – Web publish queue behavior under offline/slow networks**: web publishing is queued and drained asynchronously to keep iOS responsive, but if the network is down the queue could drop samples. Mitigation: queue is capped (drops oldest) and publishing is “best effort” by design; add optional debug timestamps if we need operator visibility.
+
+- **Low – Persisted publish opt-in**: the browser caches `publish=1` in localStorage for convenience. Risk: a user could forget it’s enabled. Mitigation: publishing remains opt-in; consider a small UI indicator later if this matters.

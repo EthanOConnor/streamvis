@@ -11,6 +11,9 @@
 - Web UI polish:
   - Tune browser color palette for readability (esp. iOS OLED contrast).
   - Add an optional light/dark theme toggle without new deps.
+- Community sharing:
+  - Add an optional UI indicator when community seeding/publishing is enabled (especially in web where it can be cached in localStorage).
+  - If browser localStorage quota is still hit even with slim persistence, evict least-recently-used dynamic gauges from persisted state (keep core Snoqualmie gauges).
 - Upstream API optimization:
   - Explore using USGS IV `modifiedSince` to skip parsing/no‑update payloads during early polls.
   - Track USGS OGC API‑Features rollout and plan a migration path if WaterServices IV is deprecated.

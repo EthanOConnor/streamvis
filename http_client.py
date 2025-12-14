@@ -11,6 +11,7 @@ Public API:
     get_json(url, params=None, timeout=10.0) -> Any
     get_text(url, params=None, timeout=10.0) -> str
     post_json(url, data=None, timeout=10.0) -> Any
+    post_json_async(url, data=None, timeout=10.0) -> Any
 """
 
 import json
@@ -124,3 +125,62 @@ def post_json(
         return resp.json()
     except Exception:
         return resp.text
+
+
+async def post_json_async(
+    url: str,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+) -> Any:
+    """
+    Async POST for Pyodide/browser builds.
+
+    In CPython:
+        - Delegates to post_json() (blocking).
+
+    In Pyodide:
+        - Uses browser fetch via js.fetch and an AbortController timeout.
+        - Raises on non-2xx status, matching requests.raise_for_status().
+    """
+    if not _USE_PYODIDE:
+        return post_json(url, data=data, timeout=timeout)
+
+    try:
+        import js  # type: ignore[import]
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("Pyodide js module is required for async POST") from exc
+
+    payload = json.dumps(data or {}, separators=(",", ":"), sort_keys=True)
+    controller = js.AbortController.new()
+    options = js.Object.new()
+    options.method = "POST"
+    options.body = payload
+    options.signal = controller.signal
+    options.keepalive = True
+
+    timeout_ms = int(max(0.0, float(timeout)) * 1000.0)
+    timer = None
+    if timeout_ms > 0:
+        try:
+            timer = js.setTimeout(controller.abort, timeout_ms)
+        except Exception:
+            timer = None
+
+    try:
+        resp = await js.fetch(url, options)
+        ok = bool(getattr(resp, "ok", False))
+        if not ok:
+            status = getattr(resp, "status", None)
+            raise RuntimeError(f"HTTP POST {status}")
+        text = await resp.text()
+    finally:
+        if timer is not None:
+            try:
+                js.clearTimeout(timer)
+            except Exception:
+                pass
+
+    try:
+        return json.loads(text)
+    except Exception:
+        return text

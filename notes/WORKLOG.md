@@ -181,3 +181,9 @@
 - Synced `streamvis_state.json` to browser `localStorage` on every `save_state()` so mid‑run reloads keep learned cadence/latency.
 - Added optional community read/publish hooks (`--community-base`, `--community-publish`) to seed cold starts from shared priors and contribute per‑update latency samples (native only).
 - Documented the community aggregator contract in `notes/COMMUNITY_AGGREGATOR.md` and added a minimal Cloudflare Worker example in `serverless/community_worker.js`.
+
+## 2025-12-14 – Web publish + storage fallback
+
+- Added async `post_json_async()` (Pyodide fetch + timeout) and a queued web publishing path so browser clients can contribute community samples without blocking the UI tick.
+- Added compact JSON + slim-state fallback for browser `localStorage` persistence to better survive iOS/Safari storage quotas.
+- Wired browser configuration for community flags via URL query params (`?community=...&publish=1`) with cached settings in localStorage.

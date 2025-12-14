@@ -8,6 +8,50 @@ const loadingProgressEl = document.getElementById("loading-progress");
 // Global key queue consumed by web_curses.getch().
 window.streamvisKeyQueue = [];
 
+function initCommunityConfig() {
+  const params = new URLSearchParams(window.location.search);
+  const baseParam = params.get("community") || params.get("community_base");
+  const publishParam =
+    params.get("publish") || params.get("community_publish") || params.get("publish_samples");
+
+  let base = "";
+  if (typeof baseParam === "string" && baseParam) {
+    base = baseParam;
+    try {
+      window.localStorage.setItem("streamvis_community_base", base);
+    } catch (_err) {
+      // Ignore storage failures.
+    }
+  } else {
+    try {
+      base = window.localStorage.getItem("streamvis_community_base") || "";
+    } catch (_err) {
+      base = "";
+    }
+  }
+
+  let publish = false;
+  if (publishParam !== null) {
+    publish = publishParam === "1" || publishParam === "true" || publishParam === "yes";
+    try {
+      window.localStorage.setItem("streamvis_community_publish", publish ? "1" : "0");
+    } catch (_err) {
+      // Ignore storage failures.
+    }
+  } else {
+    try {
+      publish = window.localStorage.getItem("streamvis_community_publish") === "1";
+    } catch (_err) {
+      publish = false;
+    }
+  }
+
+  window.streamvisCommunityBase = base;
+  window.streamvisCommunityPublish = publish;
+}
+
+initCommunityConfig();
+
 // User location bridge for the Nearby feature.
 window.streamvisUserLocation = null;
 window.streamvisLocationError = null;

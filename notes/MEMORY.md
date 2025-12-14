@@ -208,3 +208,16 @@
   - Seeding rule: remote priors are adopted only when local confidence is low (no/weak `cadence_mult`, missing `phase_offset_sec`, or <3 latency samples) so local learning remains authoritative after a short warm‑up.
   - Publishing rule: contribute once per real observation advance, carrying the observation timestamp, poll timestamp, and latency window + best sample. Web clients do not publish yet (no synchronous POST path), but still read priors.
   - Rationale: enables low‑latency cold starts and faster convergence across many clients without requiring a central operator or heavy infra.
+
+## 2025-12-14 – Web community publishing + quota-aware persistence
+
+- **Web community publishing**:
+  - Decision: support publishing from Pyodide via an async POST path (`http_client.post_json_async`) and a small in‑process queue drained in the background so the TUI loop stays responsive on iOS/Safari.
+  - Rationale: “community” only works if web clients can contribute too; blocking on network inside the UI tick risks iOS hangs.
+
+- **Web configuration (low/zero config)**:
+  - Decision: allow `--community-base` / `--community-publish` to be configured from the browser URL (`?community=...&publish=1`) and cache those settings in localStorage (`streamvis_community_base`, `streamvis_community_publish`) so users don’t need to edit Python files to participate.
+
+- **Quota-aware state persistence**:
+  - Decision: when syncing state to browser `localStorage`, write compact JSON; on quota errors, fall back to persisting a slimmed state that keeps cadence/latency learning and last readings while dropping bulky overlays (forecast/NW RFC) and trimming histories.
+  - Trade-off: a reload after a quota fallback may lose some UI history detail until the next backfill/forecast refresh, but scheduling behavior remains intact.

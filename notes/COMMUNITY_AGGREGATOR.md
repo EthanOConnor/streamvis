@@ -7,7 +7,7 @@ This is an optional, low/zero‑config “community” service that multiple
 - Cadence phase offset on that grid.
 - Observation → USGS IV visibility latency (robust location/scale).
 
-The native CLI can **publish** per‑update samples, and both native + web
+Native and web clients can **publish** per‑update samples, and both native + web
 clients can **read** shared summaries to seed cold starts.
 
 The service is intentionally simple and privacy‑conservative. Clients only
@@ -85,8 +85,8 @@ Response: any JSON confirming acceptance (or an error). Clients ignore failures.
 
 ### Publishing (`--community-base` + `--community-publish`)
 - Native clients POST once per **real update** (advanced observation timestamp).
-- Web/Pyodide clients currently do not publish because there is no synchronous
-  POST path; they still benefit from reading summaries.
+- Web/Pyodide clients publish using an async fetch path, queued so it does not
+  block the UI tick on iOS/Safari. Failures are ignored.
 
 ## Privacy / safety
 
@@ -105,4 +105,3 @@ Any static host + tiny serverless function works. Suggested setups:
 - Fly.io / small VPS with a tiny Flask/FastAPI app
 
 See `serverless/community_worker.js` for a minimal Worker example.
-

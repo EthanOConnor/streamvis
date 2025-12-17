@@ -3719,6 +3719,16 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_false",
         help="Disable bell/flash when new data is fetched in TUI mode.",
     )
+    parser.add_argument(
+        "--usgs-backend",
+        choices=["blended", "waterservices", "ogc"],
+        default="blended",
+        help=(
+            "USGS API backend selection: 'blended' (default) fetches from both APIs "
+            "and learns which is faster, 'waterservices' uses legacy API only, "
+            "'ogc' uses new OGC API only."
+        ),
+    )
     parser.set_defaults(update_alert=True)
     return parser.parse_args(argv)
 

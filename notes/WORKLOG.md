@@ -225,3 +225,23 @@ Major refactor to address P1 priorities from codebase review:
 - All 12 existing scheduler tests pass
 - Package imports verified from both `import streamvis` and `from streamvis.* import *`
 - Backward compatibility maintained for direct execution and imports
+
+## 2025-12-17 – Complete Modularization + CLI Flag
+
+Completed extraction of remaining core modules:
+
+### Additional Modules
+- `streamvis/scheduler.py` (285 lines): Cadence learning, phase offset estimation, two-regime poll scheduling
+- `streamvis/state.py` (462 lines): Load/save with atomic writes, single-writer locking, cleanup, backfill, observation update logic with latency learning
+
+### CLI Enhancement
+- Added `--usgs-backend {blended,waterservices,ogc}` flag
+  - `blended` (default): Fetches from both APIs, learns which is faster
+  - `waterservices`: Legacy API only
+  - `ogc`: New OGC API only
+
+### Verification
+- All 12 tests pass
+- CLI help shows new `--usgs-backend` option
+- Package imports work correctly
+

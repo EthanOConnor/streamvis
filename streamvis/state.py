@@ -313,7 +313,7 @@ def maybe_backfill_state(state: dict[str, Any], hours_back: int) -> None:
         return
     
     from streamvis.usgs import fetch_gauge_history
-    from streamvis_monolith import SITE_MAP
+    from streamvis.config import SITE_MAP
     
     history = fetch_gauge_history(SITE_MAP, hours_back)
     backfill_state_with_history(state, history)
@@ -341,7 +341,7 @@ def maybe_periodic_backfill_check(
             return
     
     from streamvis.usgs import fetch_gauge_history
-    from streamvis_monolith import SITE_MAP
+    from streamvis.config import SITE_MAP
     
     history = fetch_gauge_history(SITE_MAP, lookback_hours)
     backfill_state_with_history(state, history)

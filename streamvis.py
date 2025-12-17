@@ -7,18 +7,16 @@ This file maintains backward compatibility for:
 - Old-style imports: from streamvis import ...
 - pip install entry point
 
-During the migration, this re-exports everything from the monolith.
-After migration completes, this will import from the streamvis package.
+All functionality is now in the streamvis package.
 """
 
 from __future__ import annotations
 
-# Re-export everything from the monolith for backward compatibility
-# Using star import for public API
-from streamvis_monolith import *  # noqa: F401, F403
+# Re-export public API from the package
+from streamvis.tui import *  # noqa: F401, F403
 
-# Explicitly re-export private functions used by tests
-from streamvis_monolith import (
+# Explicitly re-export functions used by tests
+from streamvis.tui import (
     _parse_usgs_site_rdb,
     _dynamic_gauge_id,
     _iso8601_duration,
@@ -39,6 +37,7 @@ from streamvis_monolith import (
 )
 
 if __name__ == "__main__":
-    from streamvis_monolith import main
+    from streamvis.tui import main
     raise SystemExit(main())
+
 

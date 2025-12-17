@@ -17,11 +17,10 @@ Public API:
 from __future__ import annotations
 
 # Version
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-# Re-export public API from the monolith during migration
-# This will be updated as we extract modules
-from streamvis_monolith import (
+# Re-export public API from tui module
+from streamvis.tui import (
     # Core functions
     main,
     web_tui_main,
@@ -37,13 +36,21 @@ from streamvis_monolith import (
     save_state,
     state_lock,
     StateLockError,
-    # Configuration
+    # Utilities
+    tukey_biweight_location_scale,
+)
+
+# Configuration from config module
+from streamvis.config import (
     SITE_MAP,
     STATION_LOCATIONS,
     PRIMARY_GAUGES,
     ordered_gauges,
     CONFIG,
-    # Constants (will move to constants.py)
+)
+
+# Constants
+from streamvis.constants import (
     CADENCE_BASE_SEC,
     CADENCE_FIT_THRESHOLD,
     MIN_RETRY_SEC,
@@ -52,15 +59,16 @@ from streamvis_monolith import (
     HISTORY_LIMIT,
     UI_TICK_SEC,
     FINE_STEP_MIN_SEC,
-    # Utilities (will move to utils.py)
+)
+
+# Utilities from gauges module
+from streamvis.gauges import (
     classify_status,
-    tukey_biweight_location_scale,
     nearest_gauges,
 )
 
 # Re-export private functions for test compatibility
-# These will become public as they're extracted to modules
-from streamvis_monolith import (
+from streamvis.tui import (
     _parse_usgs_site_rdb,
     _dynamic_gauge_id,
     _iso8601_duration,
@@ -133,4 +141,3 @@ __all__ = [
     "GaugeReading",
     "BackendStats",
 ]
-

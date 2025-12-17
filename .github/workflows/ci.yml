@@ -64,7 +64,7 @@ jobs:
         run: |
           echo "Checking required files for web deployment..."
           test -f streamvis.py || { echo "❌ streamvis.py missing"; exit 1; }
-          test -f streamvis_monolith.py || { echo "❌ streamvis_monolith.py missing"; exit 1; }
+          test -f streamvis/tui.py || { echo "❌ streamvis/tui.py missing"; exit 1; }
           test -f http_client.py || { echo "❌ http_client.py missing"; exit 1; }
           test -f web_curses.py || { echo "❌ web_curses.py missing"; exit 1; }
           test -f web_entrypoint.py || { echo "❌ web_entrypoint.py missing"; exit 1; }
@@ -75,11 +75,11 @@ jobs:
       - name: Verify main.js loads all required modules
         run: |
           echo "Checking main.js module loading..."
-          grep -q "streamvis_monolith.py" web/main.js || { 
-            echo "❌ main.js doesn't load streamvis_monolith.py"
+          grep -q "streamvis/tui.py" web/main.js || { 
+            echo "❌ main.js doesn't load streamvis/tui.py"
             exit 1
           }
-          echo "✅ main.js properly loads monolith"
+          echo "✅ main.js properly loads tui module"
 
   deploy-pages:
     needs: [test, web-module-check]

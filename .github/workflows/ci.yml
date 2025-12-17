@@ -1,0 +1,112 @@
+# CI/CD Pipeline for streamvis
+# 
+# This workflow runs on every push and PR to master branch.
+# It ensures tests pass and module imports work before deployment.
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests  # For http_client
+      
+      - name: Run unit tests
+        run: python -m unittest discover tests -v
+      
+      - name: Verify package imports
+        run: |
+          echo "Testing package imports..."
+          python -c "import streamvis"
+          python -c "from streamvis import SITE_MAP, main, schedule_next_poll"
+          python -c "from streamvis.types import GaugeState, AppState, BackendStats"
+          python -c "from streamvis.constants import CADENCE_BASE_SEC"
+          python -c "from streamvis.utils import parse_timestamp, ewma"
+          python -c "from streamvis.scheduler import predict_gauge_next"
+          python -c "from streamvis.state import load_state"
+          python -c "from streamvis.usgs import fetch_gauge_data, USGSBackend"
+          python -c "from streamvis.location import get_location"
+          echo "All imports successful!"
+      
+      - name: Verify CLI help
+        run: python streamvis.py --help
+
+  web-module-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Verify web modules exist
+        run: |
+          echo "Checking required files for web deployment..."
+          test -f streamvis.py || { echo "❌ streamvis.py missing"; exit 1; }
+          test -f streamvis_monolith.py || { echo "❌ streamvis_monolith.py missing"; exit 1; }
+          test -f http_client.py || { echo "❌ http_client.py missing"; exit 1; }
+          test -f web_curses.py || { echo "❌ web_curses.py missing"; exit 1; }
+          test -f web_entrypoint.py || { echo "❌ web_entrypoint.py missing"; exit 1; }
+          test -f web/index.html || { echo "❌ web/index.html missing"; exit 1; }
+          test -f web/main.js || { echo "❌ web/main.js missing"; exit 1; }
+          echo "✅ All required web files present"
+      
+      - name: Verify main.js loads all required modules
+        run: |
+          echo "Checking main.js module loading..."
+          grep -q "streamvis_monolith.py" web/main.js || { 
+            echo "❌ main.js doesn't load streamvis_monolith.py"
+            exit 1
+          }
+          echo "✅ main.js properly loads monolith"
+
+  deploy-pages:
+    needs: [test, web-module-check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+      
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

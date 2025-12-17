@@ -292,6 +292,8 @@ async function main() {
   setLoading("Loading streamvis modules…", 90);
   await loadPythonModule(pyodide, "../http_client.py");
   await loadPythonModule(pyodide, "../web_curses.py");
+  // Load the monolith first - the shim imports from it
+  await loadPythonModule(pyodide, "../streamvis_monolith.py");
   await loadPythonModule(pyodide, "../streamvis.py");
   await loadPythonModule(pyodide, "../web_entrypoint.py");
 

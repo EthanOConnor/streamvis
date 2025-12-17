@@ -245,3 +245,32 @@ Completed extraction of remaining core modules:
 - CLI help shows new `--usgs-backend` option
 - Package imports work correctly
 
+## 2025-12-17 – Monolith Elimination
+
+Completed elimination of `streamvis_monolith.py`:
+
+- Renamed monolith to `streamvis/tui.py` (git detected as 100% rename)
+- Created `streamvis/config.py` (195 lines): TOML loading, SITE_MAP, STATION_LOCATIONS
+- Created `streamvis/gauges.py` (145 lines): classify_status, nearest_gauges, RDB parsing
+- Updated all imports to use package modules
+- Updated CI workflow to verify `streamvis/tui.py` instead of monolith
+- Updated `web/main.js` to load `streamvis/tui.py`
+
+Package structure now:
+```
+streamvis/
+├── __init__.py      # Public API
+├── __main__.py      # python -m streamvis
+├── config.py        # Configuration loading
+├── constants.py     # Constants
+├── gauges.py        # Gauge utilities
+├── location.py      # Native geolocation
+├── scheduler.py     # Cadence learning
+├── state.py         # State persistence
+├── tui.py           # Main TUI application
+├── types.py         # TypedDict definitions
+├── utils.py         # Pure utilities
+└── usgs/            # USGS API clients
+```
+
+All 12 tests pass. Web deployment now loads from package.

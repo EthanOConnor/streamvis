@@ -187,3 +187,41 @@
 - Added async `post_json_async()` (Pyodide fetch + timeout) and a queued web publishing path so browser clients can contribute community samples without blocking the UI tick.
 - Added compact JSON + slim-state fallback for browser `localStorage` persistence to better survive iOS/Safari storage quotas.
 - Wired browser configuration for community flags via URL query params (`?community=...&publish=1`) with cached settings in localStorage.
+
+## 2025-12-17 – P1 Implementation: Modularization + Dual-Stack USGS API
+
+Major refactor to address P1 priorities from codebase review:
+
+### Package Structure
+- Transformed monolith into `streamvis/` package while maintaining backward compatibility
+- Renamed original to `streamvis_monolith.py` with shim at `streamvis.py` for existing imports
+- Created `streamvis/__main__.py` for `python -m streamvis` execution
+
+### Type Safety (195 lines)
+- Added `streamvis/types.py` with comprehensive TypedDict definitions:
+  - `GaugeState`, `AppState`, `MetaState`, `HistoryPoint`, `ForecastState`
+  - `BackendStats` for dual-stack API latency tracking
+  - `CommunityPrior`, `USGSSite`, `GaugeReading`
+
+### Module Extraction
+- `streamvis/constants.py` (115 lines): All configuration constants + new OGC API endpoints
+- `streamvis/utils.py` (225 lines): Pure utility functions with new `ewma_variance()` for backend tracking
+- `streamvis/location.py` (195 lines): Platform-adaptive native location layer
+  - macOS: CoreLocation via osascript
+  - Linux: GeoClue D-Bus
+  - Fallback: IP-based geolocation
+
+### Dual-Stack USGS API (770 lines total)
+- `streamvis/usgs/waterservices.py`: Legacy WaterServices IV API client
+- `streamvis/usgs/ogcapi.py`: New OGC API–Features client for `api.waterdata.usgs.gov`
+- `streamvis/usgs/adapter.py`: Blended backend with:
+  - Parallel fetches from both APIs in BLENDED mode
+  - Per-backend EWMA latency and variance tracking
+  - Statistical backend selection when confidence reached
+  - 10% hysteresis to avoid flip-flopping
+  - Periodic probing of non-preferred backend
+
+### Verification
+- All 12 existing scheduler tests pass
+- Package imports verified from both `import streamvis` and `from streamvis.* import *`
+- Backward compatibility maintained for direct execution and imports

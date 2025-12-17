@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+Streamvis TUI - Terminal user interface for river gauge monitoring.
+
+This module contains the main application logic:
+- TUI rendering and input handling
+- Forecast integration (NWPS, NWRFC)
+- Community data publishing
+- CLI entrypoint
+"""
 
 from __future__ import annotations
 
@@ -14,362 +23,120 @@ from typing import Any, Dict, List
 
 from http_client import get_json, get_text, post_json, post_json_async
 
+# --- Import from extracted modules ---
+
+# Constants
+from streamvis.constants import (
+    STATE_FILE_DEFAULT,
+    STATE_SCHEMA_VERSION,
+    CADENCE_BASE_SEC,
+    CADENCE_SNAP_TOL_SEC,
+    CADENCE_FIT_THRESHOLD,
+    CADENCE_CLEAR_THRESHOLD,
+    DEFAULT_INTERVAL_SEC,
+    MIN_RETRY_SEC,
+    MAX_RETRY_SEC,
+    HEADSTART_SEC,
+    EWMA_ALPHA,
+    HISTORY_LIMIT,
+    UI_TICK_SEC,
+    MIN_UPDATE_GAP_SEC,
+    FORECAST_REFRESH_MIN,
+    MAX_LEARNABLE_INTERVAL_SEC,
+    DEFAULT_BACKFILL_HOURS,
+    PERIODIC_BACKFILL_INTERVAL_HOURS,
+    PERIODIC_BACKFILL_LOOKBACK_HOURS,
+    NEARBY_DISCOVERY_RADIUS_MILES,
+    NEARBY_DISCOVERY_MAX_RADIUS_MILES,
+    NEARBY_DISCOVERY_EXPAND_FACTOR,
+    NEARBY_DISCOVERY_MIN_INTERVAL_HOURS,
+    DYNAMIC_GAUGE_PREFIX,
+    LATENCY_PRIOR_LOC_SEC,
+    LATENCY_PRIOR_SCALE_SEC,
+    BIWEIGHT_LOC_C,
+    BIWEIGHT_SCALE_C,
+    BIWEIGHT_MAX_ITERS,
+    FINE_LATENCY_MAD_MAX_SEC,
+    FINE_WINDOW_MIN_SEC,
+    FINE_STEP_MIN_SEC,
+    FINE_STEP_MAX_SEC,
+    COARSE_STEP_FRACTION,
+    DEFAULT_USGS_IV_URL,
+    DEFAULT_USGS_SITE_URL,
+    NWRFC_TEXT_BASE,
+    NWRFC_REFRESH_MIN,
+    FLOOD_THRESHOLDS,
+    NWRFC_ID_MAP,
+)
+
+# Configuration
+from streamvis.config import (
+    CONFIG,
+    SITE_MAP,
+    STATION_LOCATIONS,
+    PRIMARY_GAUGES,
+    ordered_gauges,
+    USGS_IV_URL,
+)
+
+# Utilities - import with underscore aliases for backward compatibility
+from streamvis.utils import (
+    parse_timestamp as _parse_timestamp,
+    fmt_clock as _fmt_clock,
+    fmt_rel as _fmt_rel,
+    parse_nwrfc_timestamp as _parse_nwrfc_timestamp,
+    ewma as _ewma,
+    iso8601_duration as _iso8601_duration,
+    median as _median,
+    mad as _mad,
+    tukey_biweight_location_scale,
+    haversine_miles as _haversine_miles,
+    bbox_for_radius as _bbox_for_radius,
+    coerce_float as _coerce_float,
+)
+
+# Gauges
+from streamvis.gauges import (
+    classify_status,
+    nearest_gauges,
+    station_display_name,
+    parse_usgs_site_rdb as _parse_usgs_site_rdb,
+    dynamic_gauge_id as _dynamic_gauge_id,
+)
+
+# Scheduler
+from streamvis.scheduler import (
+    snap_delta_to_cadence as _snap_delta_to_cadence,
+    estimate_cadence_multiple as _estimate_cadence_multiple,
+    maybe_update_cadence_from_deltas as _maybe_update_cadence_from_deltas,
+    estimate_phase_offset_sec as _estimate_phase_offset_sec,
+    predict_gauge_next,
+    schedule_next_poll,
+    control_summary,
+)
+
+# State management
+from streamvis.state import (
+    StateLockError,
+    state_lock,
+    load_state,
+    save_state,
+    cleanup_state as _cleanup_state,
+    slim_state_for_browser as _slim_state_for_browser,
+    backfill_state_with_history,
+    update_state_with_readings,
+)
+
 try:
     import fcntl  # type: ignore[import]
 except Exception:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-STATE_FILE_DEFAULT = Path.home() / ".streamvis_state.json"
-# Increment when the on-disk state schema changes in a backward-incompatible way.
-STATE_SCHEMA_VERSION = 1
-# Observation cadence prior.
-# Most Snoqualmie gauges update on 15-minute multiples (15/30/60 min).
-# We start from a 15-minute base and let deltas/backfill snap us to the
-# best-fitting multiple.
-CADENCE_BASE_SEC = 15 * 60
-CADENCE_SNAP_TOL_SEC = 3 * 60        # Acceptable jitter when snapping to base grid.
-CADENCE_FIT_THRESHOLD = 0.60        # Fraction of deltas that must fit a cadence multiple.
-CADENCE_CLEAR_THRESHOLD = 0.45      # Below this fit, clear an existing cadence multiple.
+# --- TUI-specific code starts here ---
 
-# Default cadence prior (seconds).
-DEFAULT_INTERVAL_SEC = CADENCE_BASE_SEC
-MIN_RETRY_SEC = 60               # Short retry when we were early or on error.
-MAX_RETRY_SEC = 5 * 60           # Cap retry wait when backing off on errors.
-HEADSTART_SEC = 30               # Poll slightly before expected update.
-EWMA_ALPHA = 0.30                # How quickly to learn update cadence.
-HISTORY_LIMIT = 120              # Keep a small rolling window of observations.
-UI_TICK_SEC = 0.15               # UI refresh tick for TUI mode.
-MIN_UPDATE_GAP_SEC = 60          # Ignore sub-60-second deltas when learning cadence.
-FORECAST_REFRESH_MIN = 60        # Do not refetch forecasts more often than this.
-MAX_LEARNABLE_INTERVAL_SEC = 6 * 3600  # Do not learn cadences longer than 6 hours.
-
-# Backfill behavior.
-DEFAULT_BACKFILL_HOURS = 6               # Backfill this much history on startup by default.
-PERIODIC_BACKFILL_INTERVAL_HOURS = 6     # How often to re-check recent history.
-PERIODIC_BACKFILL_LOOKBACK_HOURS = 6     # How much recent history to re-fetch on checks.
-
-# Nearby discovery behavior.
-NEARBY_DISCOVERY_RADIUS_MILES = 30.0
-NEARBY_DISCOVERY_MAX_RADIUS_MILES = 180.0
-NEARBY_DISCOVERY_EXPAND_FACTOR = 2.0
-NEARBY_DISCOVERY_MIN_INTERVAL_HOURS = 24.0
-DYNAMIC_GAUGE_PREFIX = "U"  # Prefix for dynamically-added gauges.
-
-# Latency priors and robust estimation (Tukey biweight).
-LATENCY_PRIOR_LOC_SEC = 600.0
-LATENCY_PRIOR_SCALE_SEC = 100.0
-BIWEIGHT_LOC_C = 6.0
-BIWEIGHT_SCALE_C = 9.0
-BIWEIGHT_MAX_ITERS = 5
-
-# Fine/coarse polling control for adaptive scheduling.
-FINE_LATENCY_MAD_MAX_SEC = 60    # Only micro-poll if latency MAD <= 1 minute.
-FINE_WINDOW_MIN_SEC = 30         # Minimum half-width of fine window.
-FINE_STEP_MIN_SEC = 15           # Minimum fine-mode poll step (keep bursts polite).
-FINE_STEP_MAX_SEC = 30           # Maximum fine-mode poll step.
-COARSE_STEP_FRACTION = 0.5       # Coarse step ~ fraction of mean interval.
-# We no longer hard-cap coarse steps; mean_interval is already clamped, so
-# slow gauges can sleep proportionally longer without excess polling.
-
-CONFIG_PATH = Path(__file__).with_name("config.toml")
-
-
-def _parse_toml_value(raw: str) -> Any:
-    """
-    Minimal TOML value parser for the subset used in config.toml.
-    Supports strings, integers, floats, and booleans.
-    """
-    raw = raw.strip()
-    if not raw:
-        return ""
-    if raw[0] == raw[-1] == '"':
-        inner = raw[1:-1]
-        return inner.replace(r"\\", "\\").replace(r"\"", "\"").replace(r"\n", "\n")
-    lowered = raw.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    try:
-        if any(ch in raw for ch in (".", "e", "E")):
-            return float(raw)
-        return int(raw)
-    except ValueError:
-        return raw
-
-
-def _load_toml_config(path: Path) -> Dict[str, Any]:
-    """
-    Minimal, dependency-free TOML loader tailored to this project's config.toml.
-    It understands:
-      - Comment lines starting with '#'
-      - Section headers like [section] or [a.b]
-      - Simple key = value pairs where value is a scalar.
-    Any parse error results in an empty config so the runtime can fall back
-    to built-in defaults.
-    """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except Exception:
-        return {}
-
-    root: Dict[str, Any] = {}
-    current: Dict[str, Any] = root
-
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip()
-            if not section:
-                # Skip invalid section headers.
-                current = root
-                continue
-            parts = [p.strip() for p in section.split(".") if p.strip()]
-            current = root
-            for part in parts:
-                child = current.setdefault(part, {})
-                if not isinstance(child, dict):
-                    # Conflicting types; give up on this section.
-                    child = {}
-                current = child
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key:
-            continue
-        current[key] = _parse_toml_value(value)
-
-    return root
-
-
-CONFIG: Dict[str, Any] = _load_toml_config(CONFIG_PATH)
-
-# Built-in defaults for USGS plumbing; config.toml can override these.
-DEFAULT_SITE_MAP: Dict[str, str] = {
-    "TANW1": "12141300",  # Middle Fork Snoqualmie R near Tanner
-    "GARW1": "12143400",  # SF Snoqualmie R ab Alice Cr nr Garcia
-    "EDGW1": "12143600",  # SF Snoqualmie R at Edgewick
-    "SQUW1": "12144500",  # Snoqualmie R near Snoqualmie
-    "CRNW1": "12149000",  # Snoqualmie R near Carnation
-}
-
-DEFAULT_USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
-DEFAULT_USGS_SITE_URL = "https://waterservices.usgs.gov/nwis/site/"
-
-
-def _site_map_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
-    stations = cfg.get("stations")
-    if not isinstance(stations, dict):
-        return {}
-    site_map: Dict[str, str] = {}
-    for key, entry in stations.items():
-        if not isinstance(entry, dict):
-            continue
-        gauge_id = entry.get("gauge_id") or key
-        site_no = entry.get("usgs_site_no")
-        if isinstance(gauge_id, str) and isinstance(site_no, str) and site_no:
-            site_map[gauge_id] = site_no
-    return site_map
-
-
-def _usgs_iv_url_from_config(cfg: Dict[str, Any]) -> str:
-    global_cfg = cfg.get("global")
-    if isinstance(global_cfg, dict):
-        usgs_cfg = global_cfg.get("usgs")
-        if isinstance(usgs_cfg, dict):
-            base = usgs_cfg.get("iv_base_url")
-            if isinstance(base, str) and base:
-                return base
-    return DEFAULT_USGS_IV_URL
-
-
-# USGS gauge IDs for the Snoqualmie system we care about.
-SITE_MAP: Dict[str, str] = _site_map_from_config(CONFIG) or DEFAULT_SITE_MAP
-
-# Preferred ordering for gauges in CLI/TUI. Any additional gauges present
-# in SITE_MAP (e.g., Skagit at Concrete) are appended after these.
-PRIMARY_GAUGES: List[str] = ["TANW1", "GARW1", "EDGW1", "SQUW1", "CRNW1"]
-
-
-def ordered_gauges() -> List[str]:
-    primary = [g for g in PRIMARY_GAUGES if g in SITE_MAP]
-    extras = [g for g in sorted(SITE_MAP.keys()) if g not in PRIMARY_GAUGES]
-    return primary + extras
-
-USGS_IV_URL = _usgs_iv_url_from_config(CONFIG)
-
-# Default station locations (lat, lon) in decimal degrees.
-# These are used for the "Nearby" UI feature and can be overridden per-station
-# via config.toml `lat` / `lon` fields.
-DEFAULT_STATION_LOCATIONS: Dict[str, tuple[float, float]] = {
-    "TANW1": (47.485912, -121.647864),       # USGS 12141300
-    "GARW1": (47.4151086, -121.5873213),    # USGS 12143400
-    "EDGW1": (47.4527778, -121.7166667),    # USGS 12143600 (DMS → decimal)
-    "SQUW1": (47.5451019, -121.8423360),    # USGS 12144500
-    "CRNW1": (47.6659340, -121.9253969),    # USGS 12149000
-    "CONW1": (48.5382169, -121.7489830),    # USGS 12194000
-}
-
-
-def _station_locations_from_config(cfg: Dict[str, Any]) -> Dict[str, tuple[float, float]]:
-    stations = cfg.get("stations")
-    if not isinstance(stations, dict):
-        return {}
-    out: Dict[str, tuple[float, float]] = {}
-    for gauge_id, entry in stations.items():
-        if not isinstance(entry, dict):
-            continue
-        lat_raw = entry.get("lat") or entry.get("latitude")
-        lon_raw = entry.get("lon") or entry.get("longitude")
-        try:
-            lat = float(lat_raw)
-            lon = float(lon_raw)
-        except Exception:
-            continue
-        if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
-            out[str(gauge_id)] = (lat, lon)
-    return out
-
-
-STATION_LOCATIONS: Dict[str, tuple[float, float]] = {
-    **DEFAULT_STATION_LOCATIONS,
-    **_station_locations_from_config(CONFIG),
-}
-
-# Optional NW RFC text-plot endpoint used for cross-checking observed
-# stage/flow for selected stations. We treat USGS IV as authoritative
-# and use NW RFC as a secondary view for comparison.
-NWRFC_TEXT_BASE = "https://www.nwrfc.noaa.gov/station/flowplot/textPlot.cgi"
-NWRFC_REFRESH_MIN = 15  # Minutes between NW RFC cross-checks when enabled.
-
-NWRFC_ID_MAP: Dict[str, str] = {
-    "GARW1": "GARW1",
-    "CONW1": "CONW1",
-}
-
-# Optional: rough flood thresholds for status coloring.
-# These are real for CRNW1 & SQUW1; TANW1 & GARW1 are placeholders you can tune.
-FLOOD_THRESHOLDS: Dict[str, Dict[str, float | None]] = {
-    "CRNW1": {  # Snoqualmie near Carnation
-        "action": 50.7,
-        "minor": 54.0,
-        "moderate": 56.0,
-        "major": 58.0,
-    },
-    "SQUW1": {  # Snoqualmie at the Falls (stage equivalents)
-        "action": 11.94,
-        "minor": 13.54,
-        "moderate": 16.21,
-        "major": 17.42,
-    },
-    # You can fill these in later if you find good numbers:
-    "TANW1": {
-        "action": None,
-        "minor": None,
-        "moderate": None,
-        "major": None,
-    },
-    "GARW1": {
-        "action": None,
-        "minor": None,
-        "moderate": None,
-        "major": None,
-    },
-    "EDGW1": {
-        "action": None,
-        "minor": None,
-        "moderate": None,
-        "major": None,
-    },
-}
-
-
-def _parse_timestamp(ts: str | None) -> datetime | None:
-    if not ts:
-        return None
-    try:
-        # USGS returns ISO8601, sometimes with Z, sometimes with offset.
-        if ts.endswith("Z"):
-            ts = ts.replace("Z", "+00:00")
-        return datetime.fromisoformat(ts).astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _fmt_clock(dt: datetime | None, with_date: bool = False) -> str:
-    if dt is None:
-        return "-"
-    local_dt = dt.astimezone()
-    if with_date:
-        return local_dt.strftime("%Y-%m-%d %H:%M:%S")
-    return local_dt.strftime("%H:%M:%S")
-
-
-def _fmt_rel(now: datetime, target: datetime | None) -> str:
-    if target is None:
-        return "unknown"
-    delta = (target - now).total_seconds()
-    if abs(delta) < 1:
-        return "now"
-    suffix = "ago" if delta < 0 else "in"
-    delta = abs(delta)
-    if delta < 60:
-        val = int(delta)
-        unit = "s"
-    elif delta < 3600:
-        val = int(delta // 60)
-        unit = "m"
-    else:
-        val = int(delta // 3600)
-        unit = "h"
-    return f"{suffix} {val}{unit}"
-
-
-def _parse_nwrfc_timestamp(date_str: str, time_str: str, tz_label: str | None) -> datetime | None:
-    """
-    Parse a NW RFC local timestamp (e.g., 2025-12-08 19:00) plus a timezone
-    label like PST or PDT into a UTC datetime.
-    """
-    try:
-        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    except Exception:
-        return None
-    # Treat PST/PDT as fixed offsets; this is sufficient for the local use here.
-    tz_label = (tz_label or "").upper()
-    if tz_label == "PDT":
-        offset = -7
-    else:
-        offset = -8
-    local = dt.replace(tzinfo=timezone(timedelta(hours=offset)))
-    return local.astimezone(timezone.utc)
-
-
-def classify_status(gauge_id: str, stage_ft: float | None) -> str:
-    """Return NORMAL / ACTION / MINOR FLOOD / MOD FLOOD / MAJOR FLOOD."""
-    thr = FLOOD_THRESHOLDS.get(gauge_id) or {}
-    a = thr.get("action")
-    n = thr.get("minor")
-    m = thr.get("moderate")
-    j = thr.get("major")
-
-    # If we don't have thresholds, just say NORMAL.
-    if stage_ft is None or all(t is None for t in (a, n, m, j)):
-        return "NORMAL"
-
-    if j is not None and stage_ft >= j:
-        return "MAJOR FLOOD"
-    if m is not None and stage_ft >= m:
-        return "MOD FLOOD"
-    if n is not None and stage_ft >= n:
-        return "MINOR FLOOD"
-    if a is not None and stage_ft >= a:
-        return "ACTION"
-    return "NORMAL"
+# Note: _parse_timestamp, _fmt_clock, _fmt_rel, _parse_nwrfc_timestamp,
+# classify_status, nearest_gauges, _haversine_miles, _parse_usgs_site_rdb,
+# _dynamic_gauge_id, etc. are now imported from extracted modules above.
 
 
 def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str, Any]]:
@@ -465,172 +232,9 @@ def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str,
         stage = d["stage"]
         d["status"] = classify_status(g, stage)
 
-    return result
 
-
-def _ewma(current_mean: float, new_value: float, alpha: float = EWMA_ALPHA) -> float:
-    if current_mean <= 0:
-        return new_value
-    return (1 - alpha) * current_mean + alpha * new_value
-
-
-def _iso8601_duration(seconds: float) -> str:
-    """
-    Render a positive duration as an ISO8601 'PT..H..M..S' string for USGS APIs.
-    """
-    total = int(max(0.0, float(seconds)))
-    if total <= 0:
-        return "PT0S"
-    minutes, sec_rem = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    parts: List[str] = []
-    if hours:
-        parts.append(f"{hours}H")
-    if minutes:
-        parts.append(f"{minutes}M")
-    if sec_rem and not parts:
-        parts.append(f"{sec_rem}S")
-    return "PT" + "".join(parts)
-
-
-def _compute_modified_since(state: Dict[str, Any]) -> str | None:
-    """
-    Compute a safe modifiedSince window for a batched IV request.
-
-    USGS IV `modifiedSince` is an ISO8601 duration, filtering to stations with
-    values that have changed within that recent window. We only enable it when
-    all tracked gauges are on <= 1 hour cadences; otherwise a narrow window could
-    suppress legitimate older updates for slow gauges.
-    """
-    gauges_state = state.get("gauges", {})
-    if not isinstance(gauges_state, dict):
-        return None
-    intervals: List[float] = []
-    for g_state in gauges_state.values():
-        if not isinstance(g_state, dict):
-            continue
-        mi = g_state.get("mean_interval_sec")
-        if isinstance(mi, (int, float)) and mi > 0:
-            intervals.append(float(mi))
-    if not intervals:
-        return None
-    max_interval = max(intervals)
-    min_interval = min(intervals)
-    if max_interval > 3600.0:
-        return None
-    window_sec = max(2.0 * min_interval, 30.0 * 60.0)
-    return _iso8601_duration(window_sec)
-
-
-def _median(values: List[float]) -> float:
-    vals = sorted(values)
-    n = len(vals)
-    if n == 0:
-        return 0.0
-    mid = n // 2
-    if n % 2 == 1:
-        return float(vals[mid])
-    return 0.5 * (float(vals[mid - 1]) + float(vals[mid]))
-
-
-def _mad(values: List[float], center: float) -> float:
-    devs = [abs(v - center) for v in values]
-    return _median(devs) if devs else 0.0
-
-
-def tukey_biweight_location_scale(
-    values: List[float],
-    initial_loc: float,
-    initial_scale: float,
-    c_loc: float = BIWEIGHT_LOC_C,
-    c_scale: float = BIWEIGHT_SCALE_C,
-    max_iters: int = BIWEIGHT_MAX_ITERS,
-) -> tuple[float, float]:
-    """
-    Tukey's biweight (bisquare) robust location and scale.
-
-    Location uses tuning constant c_loc (default 6), scale uses c_scale (default 9),
-    following common robust-statistics practice.
-    """
-    clean = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0]
-    if not clean:
-        return float(initial_loc), float(max(0.0, initial_scale))
-
-    loc = float(initial_loc)
-    scale = float(max(initial_scale, 1e-6))
-
-    # Iterative biweight location.
-    for _ in range(max(1, int(max_iters))):
-        denom = c_loc * scale
-        if denom <= 0:
-            break
-        num = 0.0
-        den = 0.0
-        for v in clean:
-            u = (v - loc) / denom
-            if abs(u) >= 1.0:
-                continue
-            w = (1.0 - u * u) ** 2
-            num += (v - loc) * w
-            den += w
-        if den <= 1e-12:
-            break
-        delta = num / den
-        if abs(delta) < 1e-3:
-            loc += delta
-            break
-        loc += delta
-
-    # Biweight scale (midvariance) using final loc and initial scale.
-    denom = c_scale * scale
-    if denom <= 0:
-        return loc, 0.0
-    num = 0.0
-    den = 0.0
-    for v in clean:
-        u = (v - loc) / denom
-        if abs(u) >= 1.0:
-            continue
-        one_minus = 1.0 - u * u
-        num += (v - loc) ** 2 * (one_minus ** 4)
-        den += one_minus * (1.0 - 5.0 * u * u)
-    den = abs(den)
-    if den <= 1e-12:
-        return loc, 0.0
-    scale_bi = math.sqrt(len(clean) * num) / den
-    return loc, float(max(scale_bi, 0.0))
-
-
-def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """
-    Great-circle distance between two points in miles.
-    """
-    r_miles = 3958.8
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1 - a)))
-    return r_miles * c
-
-
-def nearest_gauges(user_lat: float, user_lon: float, n: int = 3) -> List[tuple[str, float]]:
-    """
-    Return the n nearest gauges to the given user location.
-
-    Returns a list of (gauge_id, distance_miles) sorted nearest-first.
-    """
-    candidates: List[tuple[float, str]] = []
-    for gauge_id, coords in STATION_LOCATIONS.items():
-        try:
-            lat, lon = coords
-            dist = _haversine_miles(user_lat, user_lon, float(lat), float(lon))
-            candidates.append((dist, gauge_id))
-        except Exception:
-            continue
-    candidates.sort(key=lambda x: x[0])
-    return [(gid, d) for d, gid in candidates[: max(0, int(n))]]
+# _ewma, _iso8601_duration, _median, _mad, tukey_biweight_location_scale,
+# _haversine_miles, nearest_gauges are imported from utils/gauges modules.
 
 
 def _parse_usgs_site_rdb(text: str) -> List[Dict[str, Any]]:

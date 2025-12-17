@@ -228,3 +228,33 @@ def coerce_float(val) -> float | None:
         return f if math.isfinite(f) else None
     except (TypeError, ValueError):
         return None
+
+
+def compute_modified_since(state: dict) -> str | None:
+    """
+    Compute a safe modifiedSince window for a batched IV request.
+
+    USGS IV `modifiedSince` is an ISO8601 duration, filtering to stations with
+    values that have changed within that recent window. We only enable it when
+    all tracked gauges are on <= 1 hour cadences; otherwise a narrow window could
+    suppress legitimate older updates for slow gauges.
+    """
+    gauges_state = state.get("gauges", {})
+    if not isinstance(gauges_state, dict):
+        return None
+    intervals: list[float] = []
+    for g_state in gauges_state.values():
+        if not isinstance(g_state, dict):
+            continue
+        mi = g_state.get("mean_interval_sec")
+        if isinstance(mi, (int, float)) and mi > 0:
+            intervals.append(float(mi))
+    if not intervals:
+        return None
+    max_interval = max(intervals)
+    min_interval = min(intervals)
+    if max_interval > 3600.0:
+        return None
+    window_sec = max(2.0 * min_interval, 30.0 * 60.0)
+    return iso8601_duration(window_sec)
+

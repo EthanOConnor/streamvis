@@ -320,3 +320,8 @@ All 12 tests pass. Web deployment now loads from package.
 - Fixed a Nearby UX glitch where newly discovered gauges could show blank fields on the first refresh due to WaterServices `modifiedSince` omitting stations we have never seen before.
 - `fetch_gauge_data()` now disables `modifiedSince` until every tracked gauge has at least one `last_timestamp` in state; after that, the bandwidth optimization can resume safely.
 - Added a regression test to keep this behavior stable (`tests/test_nearby.py`).
+
+## 2025-12-18 – Native fetch error visibility (USGS adapter)
+
+- Fixed a native-only UX issue where both USGS backends could fail but the TUI would only show “USGS fetch failed” with no underlying reason.
+- `streamvis/usgs/waterservices.py` and `streamvis/usgs/ogcapi.py` now let HTTP exceptions propagate to the adapter so it can record `last_fail_reason` and surface it in the UI.

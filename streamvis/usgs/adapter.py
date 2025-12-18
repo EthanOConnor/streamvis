@@ -250,7 +250,7 @@ def fetch_gauge_data(
             )
             success = bool(ws_readings)
             new_meta["waterservices"] = _update_backend_stats(
-                new_meta["waterservices"], ws_latency, success
+                new_meta["waterservices"], ws_latency, success, fail_reason="" if success else "empty response"
             )
         except Exception as e:
             new_meta["waterservices"] = _update_backend_stats(
@@ -263,7 +263,7 @@ def fetch_gauge_data(
             ogc_readings, ogc_latency = ogcapi.fetch_latest(site_map)
             success = bool(ogc_readings)
             new_meta["ogc"] = _update_backend_stats(
-                new_meta["ogc"], ogc_latency, success
+                new_meta["ogc"], ogc_latency, success, fail_reason="" if success else "empty response"
             )
         except Exception as e:
             new_meta["ogc"] = _update_backend_stats(

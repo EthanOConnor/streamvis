@@ -178,10 +178,7 @@ def fetch_latest(
         params["modifiedSince"] = iso8601_duration(modified_since_sec)
     
     start_ms = time.monotonic() * 1000
-    try:
-        payload = get_json(base_url, params=params, timeout=timeout)
-    except Exception:
-        return {}, time.monotonic() * 1000 - start_ms
+    payload = get_json(base_url, params=params, timeout=timeout)
     latency_ms = time.monotonic() * 1000 - start_ms
 
     readings = parse_latest_payload(payload, site_map)

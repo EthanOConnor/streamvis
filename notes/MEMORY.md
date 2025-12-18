@@ -275,3 +275,8 @@
 
 - **Issue**: WaterServices `modifiedSince` can omit stations that have not changed recently. For newly added gauges (e.g., Nearby discovery) we may have no cached `last_*` values yet, so an omitted station renders as blank on the first fetch.
 - **Decision**: Disable `modifiedSince` until every currently tracked gauge has at least one `last_timestamp` in local state; after initial population, the UI can safely backfill omitted stations from cached values and the optimization can resume.
+
+## 2025-12-18 – USGS backend errors flow through adapter
+
+- **Issue**: If both WaterServices + OGC fail under native CPython (missing `requests`, TLS problems, captive portal, etc.), silently returning `{}` from the backend fetchers loses the actual error reason and the UI can only show a generic “USGS fetch failed”.
+- **Decision**: Let backend fetch exceptions propagate to `streamvis/usgs/adapter.py` (which already catches and records `last_fail_reason`) so the UI can surface actionable errors while still failing soft overall.

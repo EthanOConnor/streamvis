@@ -187,10 +187,7 @@ def fetch_latest(
     }
     
     start_ms = time.monotonic() * 1000
-    try:
-        payload = get_json(OGC_LATEST_CONTINUOUS, params=params, timeout=timeout)
-    except Exception:
-        return {}, time.monotonic() * 1000 - start_ms
+    payload = get_json(OGC_LATEST_CONTINUOUS, params=params, timeout=timeout)
     latency_ms = time.monotonic() * 1000 - start_ms
 
     readings = parse_latest_payload(payload, site_map)

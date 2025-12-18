@@ -280,3 +280,9 @@
 
 - **Issue**: If both WaterServices + OGC fail under native CPython (missing `requests`, TLS problems, captive portal, etc.), silently returning `{}` from the backend fetchers loses the actual error reason and the UI can only show a generic “USGS fetch failed”.
 - **Decision**: Let backend fetch exceptions propagate to `streamvis/usgs/adapter.py` (which already catches and records `last_fail_reason`) so the UI can surface actionable errors while still failing soft overall.
+
+## 2025-12-18 – Native HTTP fallback when `requests` is missing
+
+- **Issue**: Native runs can fail if the user runs with a Python environment that doesn’t have `requests` installed (common when a venv isn’t activated), even though the rest of the codebase is dependency-light.
+- **Decision**: `http_client.py` uses `requests` when available, but falls back to stdlib `urllib` for GET/POST when `requests` is missing.
+- **Rationale**: avoids turning “missing optional dependency” into a hard runtime failure, while still preferring `requests` for better ergonomics when installed.

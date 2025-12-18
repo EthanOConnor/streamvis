@@ -325,3 +325,7 @@ All 12 tests pass. Web deployment now loads from package.
 
 - Fixed a native-only UX issue where both USGS backends could fail but the TUI would only show “USGS fetch failed” with no underlying reason.
 - `streamvis/usgs/waterservices.py` and `streamvis/usgs/ogcapi.py` now let HTTP exceptions propagate to the adapter so it can record `last_fail_reason` and surface it in the UI.
+
+## 2025-12-18 – Native HTTP fallback when `requests` is missing
+
+- `http_client.py` now falls back to stdlib `urllib` when `requests` isn’t installed, so native runs don’t fail solely due to an unactivated venv / missing dependency.

@@ -16,6 +16,8 @@ Public API:
 
 import json
 from typing import Any, Dict, Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import urlencode
 
 
@@ -60,13 +62,25 @@ def get_text(
         - Relies on browser fetch + CORS.
     """
     if not _USE_PYODIDE:
-        if requests is None:  # pragma: no cover
-            raise RuntimeError(
-                "requests is required for native HTTP; install streamvis with pip to pull it in."
-            ) from _REQUESTS_IMPORT_ERROR
-        resp = requests.get(url, params=params, timeout=timeout)  # type: ignore[name-defined]
-        resp.raise_for_status()
-        return resp.text
+        if requests is not None:
+            resp = requests.get(url, params=params, timeout=timeout)  # type: ignore[name-defined]
+            resp.raise_for_status()
+            return resp.text
+
+        # Fallback: stdlib urllib so a missing requests install doesn't make
+        # the whole tool unusable.
+        full_url = _build_url(url, params)
+        req = urllib_request.Request(full_url)
+        try:
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                charset = resp.headers.get_content_charset() if hasattr(resp, "headers") else None
+                enc = charset or "utf-8"
+                return raw.decode(enc, errors="replace")
+        except urllib_error.HTTPError:
+            raise
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"HTTP GET failed: {full_url}") from exc
 
     full_url = _build_url(url, params)
     fp = open_url(full_url)  # type: ignore[func-returns-value]
@@ -85,13 +99,10 @@ def get_json(
     catch generically.
     """
     if not _USE_PYODIDE:
-        if requests is None:  # pragma: no cover
-            raise RuntimeError(
-                "requests is required for native HTTP; install streamvis with pip to pull it in."
-            ) from _REQUESTS_IMPORT_ERROR
-        resp = requests.get(url, params=params, timeout=timeout)  # type: ignore[name-defined]
-        resp.raise_for_status()
-        return resp.json()
+        if requests is not None:
+            resp = requests.get(url, params=params, timeout=timeout)  # type: ignore[name-defined]
+            resp.raise_for_status()
+            return resp.json()
 
     text = get_text(url, params=params, timeout=timeout)
     return json.loads(text)
@@ -115,16 +126,27 @@ def post_json(
     """
     if _USE_PYODIDE:
         raise RuntimeError("post_json is not supported under Pyodide")
-    if requests is None:  # pragma: no cover
-        raise RuntimeError(
-            "requests is required for native HTTP; install streamvis with pip to pull it in."
-        ) from _REQUESTS_IMPORT_ERROR
-    resp = requests.post(url, json=data or {}, timeout=timeout)  # type: ignore[name-defined]
-    resp.raise_for_status()
-    try:
-        return resp.json()
-    except Exception:
-        return resp.text
+    if requests is not None:
+        resp = requests.post(url, json=data or {}, timeout=timeout)  # type: ignore[name-defined]
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except Exception:
+            return resp.text
+
+    payload = json.dumps(data or {}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    req = urllib_request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    with urllib_request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        charset = resp.headers.get_content_charset() if hasattr(resp, "headers") else None
+        enc = charset or "utf-8"
+        text = raw.decode(enc, errors="replace")
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
 
 
 async def post_json_async(

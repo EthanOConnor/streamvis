@@ -238,6 +238,12 @@ Design vs implementation:
   - Smoke-test the GitHub Pages build in Chrome/Firefox/Safari, including mobile, to ensure keyboard input, redraw, and state persistence behave as expected.
 - When adding future features, keep the curses surface area small so that the `web_curses` shim stays easy to maintain and reason about.
 
+## 2025-12-18 – Pyodide package loader vs modularization
+
+- **Issue**: `web/main.js` previously wrote fetched Python files into the Pyodide FS by filename only (dropping directories), so `streamvis/tui.py` became `tui.py`. After modularization, this broke `import streamvis.*` in the browser build and encouraged “make tui.py standalone again” regressions.
+- **Resolution**: the browser loader now preserves relative paths (creating directories) and installs all `streamvis/*.py` files before importing `streamvis` via `web_entrypoint`.
+- **Residual risk**: the JS `streamvisFiles` list must be updated when new modules are added under `streamvis/`; mitigate by adding a quick Pages smoke-check whenever touching package layout.
+
 ## 2025-12-11 – Web responsive overflow follow-up
 
 - **Issue**: On some iOS/Safari viewports the rightmost column could still be clipped even after font‑first adaptation, due to optimistic cols estimation (padding not subtracted, char width assumed as `font_px * 0.55`).

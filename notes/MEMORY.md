@@ -220,4 +220,13 @@
 
 - **Quota-aware state persistence**:
   - Decision: when syncing state to browser `localStorage`, write compact JSON; on quota errors, fall back to persisting a slimmed state that keeps cadence/latency learning and last readings while dropping bulky overlays (forecast/NW RFC) and trimming histories.
-  - Trade-off: a reload after a quota fallback may lose some UI history detail until the next backfill/forecast refresh, but scheduling behavior remains intact.
+- Trade-off: a reload after a quota fallback may lose some UI history detail until the next backfill/forecast refresh, but scheduling behavior remains intact.
+
+## 2025-12-18 – Pyodide Loader Preserves Package Paths
+
+- **Decision**: In `web/main.js`, install Python modules into the Pyodide filesystem using their relative paths (e.g., `streamvis/tui.py`, `streamvis/config.py`) and delay importing `streamvis` until all package files are present.
+- **Rationale**: `streamvis` is now a real package; the prior “flatten to FS root by filename” approach breaks `import streamvis.*` after modularization and can also shadow the package with the legacy `streamvis.py` shim.
+- **Implementation**:
+  - `loadPythonModule()` derives a filesystem path from the fetched URL, creates directories, derives a dotted module name, and optionally skips the import.
+  - Browser startup writes the full fixed list of `streamvis/*.py` files with `importModule: false`, then imports `web_entrypoint` (which imports `streamvis`) once everything exists.
+- **Trade-offs**: The JS `streamvisFiles` list must be kept in sync when adding new package modules, but this is preferable to re-monolithizing `tui.py` just for the web build.

@@ -93,6 +93,7 @@ from streamvis.utils import (
     haversine_miles as _haversine_miles,
     bbox_for_radius as _bbox_for_radius,
     coerce_float as _coerce_float,
+    compute_modified_since as _compute_modified_since,
 )
 
 # Gauges
@@ -170,9 +171,18 @@ def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str,
 
     try:
         payload = get_json(USGS_IV_URL, params=params, timeout=5.0)
-    except Exception:
+    except Exception as exc:
+        if state is not None:
+            meta = state.setdefault("meta", {})
+            if isinstance(meta, dict):
+                meta["last_fetch_error"] = str(exc)
         # Network / JSON issue; show nothing but fail gracefully.
         return {}
+    else:
+        if state is not None:
+            meta = state.get("meta", {})
+            if isinstance(meta, dict):
+                meta.pop("last_fetch_error", None)
 
     # Reverse map: USGS site -> gauge ID like TANW1
     site_to_gauge = {v: k for k, v in SITE_MAP.items()}
@@ -231,6 +241,8 @@ def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str,
     for g, d in result.items():
         stage = d["stage"]
         d["status"] = classify_status(g, stage)
+
+    return result
 
 
 # _ewma, _iso8601_duration, _median, _mad, tukey_biweight_location_scale,
@@ -2399,12 +2411,27 @@ def draw_screen(
             break  # leave space for detail + footer
 
         reading = readings.get(gauge_id, {})
+        gauges_state = state.get("gauges", {})
+        g_state = gauges_state.get(gauge_id, {}) if isinstance(gauges_state, dict) else {}
+        if not isinstance(g_state, dict):
+            g_state = {}
+
         status = reading.get("status", "UNKNOWN")
         stage = reading.get("stage")
         flow = reading.get("flow")
-        observed_at = reading.get("observed_at") or _parse_timestamp(
-            state.get("gauges", {}).get(gauge_id, {}).get("last_timestamp")
-        )
+        if not isinstance(stage, (int, float)):
+            last_stage = g_state.get("last_stage")
+            if isinstance(last_stage, (int, float)):
+                stage = float(last_stage)
+        if not isinstance(flow, (int, float)):
+            last_flow = g_state.get("last_flow")
+            if isinstance(last_flow, (int, float)):
+                flow = float(last_flow)
+
+        if status == "UNKNOWN" and isinstance(stage, (int, float)):
+            status = classify_status(gauge_id, float(stage))
+
+        observed_at = reading.get("observed_at") or _parse_timestamp(g_state.get("last_timestamp"))
         next_eta = predict_gauge_next(state, gauge_id, now)
 
         stage_str = f"{stage:.2f}" if isinstance(stage, (int, float)) else "--"
@@ -2458,10 +2485,21 @@ def draw_screen(
         next_eta = predict_gauge_next(state, selected, now)
         stage = reading.get("stage")
         flow = reading.get("flow")
+        if not isinstance(stage, (int, float)):
+            last_stage = g_state.get("last_stage")
+            if isinstance(last_stage, (int, float)):
+                stage = float(last_stage)
+        if not isinstance(flow, (int, float)):
+            last_flow = g_state.get("last_flow")
+            if isinstance(last_flow, (int, float)):
+                flow = float(last_flow)
+        status = reading.get("status", "UNKNOWN")
+        if status == "UNKNOWN" and isinstance(stage, (int, float)):
+            status = classify_status(selected, float(stage))
         detail = (
             f"{selected} | Stage: {stage if stage is not None else '-'} ft | "
             f"Flow: {int(flow) if isinstance(flow, (int, float)) else '-'} cfs | "
-            f"Status: {reading.get('status', 'UNKNOWN')}"
+            f"Status: {status}"
         )
         timing = (
             f"Observed {_fmt_clock(observed_at, with_date=False)} ({_fmt_rel(now, observed_at)}), "
@@ -2864,7 +2902,11 @@ def tui_loop(args: argparse.Namespace) -> int:
                         except Exception:
                             pass
                 else:
-                    status_msg = "Fetch failed; backing off."
+                    fetch_err = state.get("meta", {}).get("last_fetch_error")
+                    if isinstance(fetch_err, str) and fetch_err:
+                        status_msg = f"Fetch failed: {fetch_err} (backing off)."
+                    else:
+                        status_msg = "Fetch failed; backing off."
                     retry_wait = min(args.max_retry_seconds, retry_wait * 2)
                     next_poll_at = now + timedelta(seconds=retry_wait)
                     state["meta"]["last_failure_at"] = now.isoformat()

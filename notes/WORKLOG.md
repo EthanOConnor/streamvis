@@ -274,3 +274,13 @@ streamvis/
 ```
 
 All 12 tests pass. Web deployment now loads from package.
+
+## 2025-12-18 – Fix Pyodide Loader For Modular Package
+
+- Updated `web/main.js` so Pyodide installs Python sources preserving package paths (e.g., `streamvis/tui.py` → `streamvis/tui.py`) and derives dotted module names for `import streamvis.*`.
+- Browser build now loads the full `streamvis/` package before importing it, and no longer loads the top-level `streamvis.py` shim (avoids module/package shadowing).
+- Fixed a native TUI crash by importing `compute_modified_since` as `_compute_modified_since` in `streamvis/tui.py` (NameError during IV fetch gating).
+- Fixed `fetch_gauge_data()` in `streamvis/tui.py` to actually return the populated `result` dict (previously returned `None`, leaving the UI with empty readings).
+- Improved native TUI degradation: when live fetch fails, the table/detail view now fall back to persisted `last_stage`/`last_flow`, and the footer shows the underlying fetch error (e.g., missing `requests`) while backing off.
+- Fixed packaging so `pip install .` installs the `streamvis/` package (and `streamvis.usgs`) instead of the legacy `streamvis.py` module; also aligned `pyproject.toml` version to `0.3.0`.
+- Verification: `node --check web/main.js`, `python -m unittest discover -s tests` (all 12 pass), `python -m streamvis --help`.

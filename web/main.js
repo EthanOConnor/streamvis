@@ -210,7 +210,27 @@ term.addEventListener("click", (ev) => {
   handleRowClick(ev);
 });
 
-async function loadPythonModule(pyodide, path) {
+function normalizePyodidePath(path) {
+  let out = path;
+  while (out.startsWith("../")) out = out.slice(3);
+  if (out.startsWith("./")) out = out.slice(2);
+  out = out.replace(/^\/+/, "");
+  return out;
+}
+
+function moduleNameFromFsPath(fsPath) {
+  const normalized = fsPath.replace(/\\/g, "/");
+  const noExt = normalized.endsWith(".py") ? normalized.slice(0, -3) : normalized;
+  const parts = noExt.split("/").filter((p) => p);
+  if (parts.length === 0) return noExt;
+  if (parts[parts.length - 1] === "__init__") {
+    parts.pop();
+  }
+  return parts.join(".");
+}
+
+async function loadPythonModule(pyodide, path, options = {}) {
+  const { importModule = true } = options;
   const candidates = [path];
   if (path.startsWith("../")) {
     candidates.push(path.slice(3));
@@ -237,16 +257,19 @@ async function loadPythonModule(pyodide, path) {
     throw new Error(`Failed to load ${path} (tried ${candidates.join(", ")})`);
   }
 
-  // Derive module name from the filename (e.g., "streamvis.py" → "streamvis").
-  const parts = usedPath.split("/");
-  const filename = parts[parts.length - 1];
-  const moduleName = filename.endsWith(".py") ? filename.slice(0, -3) : filename;
+  const fsPath = normalizePyodidePath(usedPath);
+  const moduleName = moduleNameFromFsPath(fsPath);
 
-  // Install the module into Pyodide's virtual filesystem so that normal
-  // `import moduleName` works, matching how streamvis imports http_client
-  // and web_entrypoint imports streamvis.
-  pyodide.FS.writeFile(filename, src, { encoding: "utf8" });
-  await pyodide.runPythonAsync(`import ${moduleName}`);
+  // Install into Pyodide's virtual filesystem with the same relative path
+  // so that normal `import pkg.module` works for package modules.
+  const lastSlash = fsPath.lastIndexOf("/");
+  if (lastSlash !== -1) {
+    pyodide.FS.mkdirTree(fsPath.slice(0, lastSlash));
+  }
+  pyodide.FS.writeFile(fsPath, src, { encoding: "utf8" });
+  if (importModule) {
+    await pyodide.runPythonAsync(`import ${moduleName}`);
+  }
 }
 
 async function syncStateFromLocalStorage(pyodide) {
@@ -292,9 +315,31 @@ async function main() {
   setLoading("Loading streamvis modules…", 90);
   await loadPythonModule(pyodide, "../http_client.py");
   await loadPythonModule(pyodide, "../web_curses.py");
-  // Load the streamvis package - tui.py contains the main application
-  await loadPythonModule(pyodide, "../streamvis/tui.py");
-  await loadPythonModule(pyodide, "../streamvis.py");
+
+  // Install the streamvis package files without importing yet.
+  // (Importing streamvis executes streamvis/__init__.py which imports many
+  // submodules, so they must exist in the filesystem first.)
+  const streamvisFiles = [
+    "../streamvis/__init__.py",
+    "../streamvis/constants.py",
+    "../streamvis/config.py",
+    "../streamvis/gauges.py",
+    "../streamvis/location.py",
+    "../streamvis/scheduler.py",
+    "../streamvis/state.py",
+    "../streamvis/types.py",
+    "../streamvis/utils.py",
+    "../streamvis/tui.py",
+    "../streamvis/usgs/__init__.py",
+    "../streamvis/usgs/adapter.py",
+    "../streamvis/usgs/ogcapi.py",
+    "../streamvis/usgs/waterservices.py",
+    "../streamvis/__main__.py",
+  ];
+  for (const file of streamvisFiles) {
+    await loadPythonModule(pyodide, file, { importModule: false });
+  }
+
   await loadPythonModule(pyodide, "../web_entrypoint.py");
 
   // Patch curses to point at the web_curses shim.

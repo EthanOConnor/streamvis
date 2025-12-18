@@ -239,6 +239,19 @@ def compute_modified_since(state: dict) -> str | None:
     all tracked gauges are on <= 1 hour cadences; otherwise a narrow window could
     suppress legitimate older updates for slow gauges.
     """
+    window_sec = compute_modified_since_sec(state)
+    if window_sec is None:
+        return None
+    return iso8601_duration(window_sec)
+
+
+def compute_modified_since_sec(state: dict) -> float | None:
+    """
+    Compute a safe modifiedSince window in seconds.
+
+    This is the numeric form used internally by the dual-backend USGS adapter;
+    WaterServices expects an ISO8601 duration string (see compute_modified_since()).
+    """
     gauges_state = state.get("gauges", {})
     if not isinstance(gauges_state, dict):
         return None
@@ -256,5 +269,4 @@ def compute_modified_since(state: dict) -> str | None:
     if max_interval > 3600.0:
         return None
     window_sec = max(2.0 * min_interval, 30.0 * 60.0)
-    return iso8601_duration(window_sec)
-
+    return float(window_sec)

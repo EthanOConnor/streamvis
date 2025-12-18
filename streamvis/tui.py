@@ -23,6 +23,10 @@ from typing import Any, Dict, List
 
 from http_client import get_json, get_text, post_json, post_json_async
 
+# Module aliases to avoid name-shadowing recursion in thin wrappers.
+import streamvis.scheduler as _streamvis_scheduler
+import streamvis.state as _streamvis_state
+
 # --- Import from extracted modules ---
 
 # Constants
@@ -94,6 +98,7 @@ from streamvis.utils import (
     bbox_for_radius as _bbox_for_radius,
     coerce_float as _coerce_float,
     compute_modified_since as _compute_modified_since,
+    compute_modified_since_sec as _compute_modified_since_sec,
 )
 
 # Gauges
@@ -124,8 +129,18 @@ from streamvis.state import (
     save_state,
     cleanup_state as _cleanup_state,
     slim_state_for_browser as _slim_state_for_browser,
+    evict_dynamic_sites,
     backfill_state_with_history,
+    maybe_backfill_state,
+    maybe_periodic_backfill_check,
     update_state_with_readings,
+)
+
+# USGS adapter (dual backend)
+from streamvis.usgs.adapter import (
+    USGSBackend,
+    fetch_gauge_data as _usgs_fetch_gauge_data,
+    fetch_gauge_history as _usgs_fetch_gauge_history,
 )
 
 try:
@@ -158,62 +173,71 @@ def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str,
         for g in SITE_MAP.keys()
     }
 
-    params = {
-        "format": "json",
-        "sites": ",".join(SITE_MAP.values()),
-        "parameterCd": "00060,00065",   # discharge, stage
-        "siteStatus": "all",
-    }
+    meta: dict[str, Any] = {}
+    backend = USGSBackend.BLENDED
+    modified_since_sec: float | None = None
     if state is not None:
-        ms = _compute_modified_since(state)
-        if ms:
-            params["modifiedSince"] = ms
+        meta_raw = state.setdefault("meta", {})
+        if isinstance(meta_raw, dict):
+            meta = meta_raw
+        else:
+            meta = {}
+            state["meta"] = meta
+
+        backend_raw = meta.get("api_backend") or "blended"
+        if isinstance(backend_raw, str) and backend_raw:
+            try:
+                backend = USGSBackend(backend_raw)
+            except Exception:
+                backend = USGSBackend.BLENDED
+        modified_since_sec = _compute_modified_since_sec(state)
 
     try:
-        payload = get_json(USGS_IV_URL, params=params, timeout=5.0)
+        readings, new_meta = _usgs_fetch_gauge_data(
+            SITE_MAP,
+            meta,
+            backend=backend,
+            modified_since_sec=modified_since_sec,
+        )
     except Exception as exc:
-        if state is not None:
-            meta = state.setdefault("meta", {})
-            if isinstance(meta, dict):
-                meta["last_fetch_error"] = str(exc)
-        # Network / JSON issue; show nothing but fail gracefully.
+        if state is not None and isinstance(meta, dict):
+            meta["last_fetch_error"] = str(exc)
         return {}
-    else:
-        if state is not None:
-            meta = state.get("meta", {})
-            if isinstance(meta, dict):
-                meta.pop("last_fetch_error", None)
 
-    # Reverse map: USGS site -> gauge ID like TANW1
-    site_to_gauge = {v: k for k, v in SITE_MAP.items()}
+    # Persist backend stats/decision metadata.
+    if state is not None and isinstance(meta, dict) and isinstance(new_meta, dict):
+        meta.update(new_meta)
 
-    ts_list = payload.get("value", {}).get("timeSeries", [])
-    for ts in ts_list:
-        try:
-            site_no = ts["sourceInfo"]["siteCode"][0]["value"]
-            param = ts["variable"]["variableCode"][0]["value"]  # '00060' or '00065'
-            gauge_id = site_to_gauge.get(site_no)
-            if gauge_id is None:
-                continue
+    if not readings:
+        if state is not None and isinstance(meta, dict):
+            reasons: list[str] = []
+            ws = meta.get("waterservices")
+            if isinstance(ws, dict):
+                r = ws.get("last_fail_reason")
+                if isinstance(r, str) and r:
+                    reasons.append(f"waterservices: {r}")
+            ogc = meta.get("ogc")
+            if isinstance(ogc, dict):
+                r = ogc.get("last_fail_reason")
+                if isinstance(r, str) and r:
+                    reasons.append(f"ogc: {r}")
+            meta["last_fetch_error"] = "; ".join(reasons) or "USGS fetch failed"
+        return {}
 
-            values = ts.get("values", [])
-            if not values or not values[0].get("value"):
-                continue
+    if state is not None and isinstance(meta, dict):
+        meta.pop("last_fetch_error", None)
 
-            last_point = values[0]["value"][-1]
-            val = float(last_point["value"])
-            ts_raw = last_point.get("dateTime")
-            obs_at = _parse_timestamp(ts_raw)
-        except Exception:
+    for gauge_id, reading in readings.items():
+        if gauge_id not in result or not isinstance(reading, dict):
             continue
-
-        if param == "00060":        # discharge, cfs
-            result[gauge_id]["flow"] = val
-        elif param == "00065":      # gage height, ft
-            result[gauge_id]["stage"] = val
-        # Track the freshest observation time across parameters for scheduling.
-        current_obs = result[gauge_id].get("observed_at")
-        if obs_at and (current_obs is None or obs_at > current_obs):
+        stage = reading.get("stage")
+        flow = reading.get("flow")
+        obs_at = reading.get("observed_at")
+        if isinstance(stage, (int, float)):
+            result[gauge_id]["stage"] = float(stage)
+        if isinstance(flow, (int, float)):
+            result[gauge_id]["flow"] = float(flow)
+        if isinstance(obs_at, datetime):
             result[gauge_id]["observed_at"] = obs_at
 
     # Backfill missing series from state so UI does not blank out.
@@ -248,64 +272,6 @@ def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str,
 # _ewma, _iso8601_duration, _median, _mad, tukey_biweight_location_scale,
 # _haversine_miles, nearest_gauges are imported from utils/gauges modules.
 
-
-def _parse_usgs_site_rdb(text: str) -> List[Dict[str, Any]]:
-    """
-    Parse USGS NWIS site-service RDB into a list of station dicts.
-
-    RDB is a tab-delimited format with:
-      - comment lines starting with '#'
-      - header row of column names
-      - type row
-      - data rows
-    """
-    if not text:
-        return []
-    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
-    if len(lines) < 3:
-        return []
-    header = lines[0].split("\t")
-    idx = {name: i for i, name in enumerate(header)}
-    required = ("site_no", "station_nm", "dec_lat_va", "dec_long_va")
-    if not all(k in idx for k in required):
-        return []
-    data_lines = lines[2:]
-    out: List[Dict[str, Any]] = []
-    for ln in data_lines:
-        parts = ln.split("\t")
-        if len(parts) < len(header):
-            continue
-        try:
-            site_no = parts[idx["site_no"]].strip()
-            name = parts[idx["station_nm"]].strip()
-            lat = float(parts[idx["dec_lat_va"]])
-            lon = float(parts[idx["dec_long_va"]])
-        except Exception:
-            continue
-        if not site_no:
-            continue
-        out.append(
-            {
-                "site_no": site_no,
-                "station_nm": name or site_no,
-                "lat": lat,
-                "lon": lon,
-            }
-        )
-    return out
-
-
-def _bbox_for_radius(lat: float, lon: float, radius_miles: float) -> tuple[float, float, float, float]:
-    # Rough miles-per-degree conversions.
-    lat_deg = radius_miles / 69.0
-    lon_deg = radius_miles / (69.0 * max(0.2, math.cos(math.radians(lat))))
-    west = lon - lon_deg
-    east = lon + lon_deg
-    south = lat - lat_deg
-    north = lat + lat_deg
-    return west, south, east, north
-
-
 def fetch_usgs_sites_near(
     user_lat: float,
     user_lon: float,
@@ -331,30 +297,16 @@ def fetch_usgs_sites_near(
         return []
     return _parse_usgs_site_rdb(text)
 
-
-def _dynamic_gauge_id(site_no: str, existing_ids: List[str]) -> str:
-    """
-    Derive a short, stable gauge_id for a USGS site_no, avoiding collisions.
-    """
-    suffix = site_no[-5:] if len(site_no) >= 5 else site_no
-    base = f"{DYNAMIC_GAUGE_PREFIX}{suffix}"
-    gauge_id = base[:6]
-    if gauge_id not in existing_ids:
-        return gauge_id
-    # Collision fallback: increment a numeric tail.
-    for i in range(1, 100):
-        cand = f"{DYNAMIC_GAUGE_PREFIX}{suffix[-4:]}{i}"[:6]
-        if cand not in existing_ids:
-            return cand
-    return f"{DYNAMIC_GAUGE_PREFIX}{site_no[-4:]}"[:6]
-
-
 def apply_dynamic_sites_from_state(state: Dict[str, Any]) -> None:
     """
     Merge any previously discovered dynamic sites into SITE_MAP/STATION_LOCATIONS.
     """
     meta = state.get("meta", {})
     if not isinstance(meta, dict):
+        return
+    # Dynamic sites are discovered via Nearby and should only be active when
+    # Nearby is enabled.
+    if not bool(meta.get("nearby_enabled")):
         return
     dyn = meta.get("dynamic_sites")
     if not isinstance(dyn, dict):
@@ -453,30 +405,6 @@ def maybe_discover_nearby_gauges(
     meta["nearby_search_ts"] = now.isoformat()
     return chosen_ids
 
-
-def station_display_name(gauge_id: str, state: Dict[str, Any] | None = None) -> str:
-    stations_cfg = CONFIG.get("stations")
-    if isinstance(stations_cfg, dict):
-        entry = stations_cfg.get(gauge_id)
-        if isinstance(entry, dict):
-            name = entry.get("display_name")
-            if isinstance(name, str) and name:
-                return name
-
-    if state is not None:
-        meta = state.get("meta", {})
-        if isinstance(meta, dict):
-            dyn = meta.get("dynamic_sites")
-            if isinstance(dyn, dict):
-                info = dyn.get(gauge_id)
-                if isinstance(info, dict):
-                    nm = info.get("station_nm")
-                    if isinstance(nm, str) and nm:
-                        return nm
-
-    return gauge_id
-
-
 def seed_user_location_from_args(state: Dict[str, Any], args: argparse.Namespace) -> None:
     lat = getattr(args, "user_lat", None)
     lon = getattr(args, "user_lon", None)
@@ -544,6 +472,8 @@ def toggle_nearby(state: Dict[str, Any], args: argparse.Namespace | None = None)
     enabled = not bool(meta.get("nearby_enabled", False))
     meta["nearby_enabled"] = enabled
     if enabled:
+        # If we have any previously cached dynamic sites, activate them now.
+        apply_dynamic_sites_from_state(state)
         if args is not None:
             seed_user_location_from_args(state, args)
         loc = refresh_user_location_web(state)
@@ -566,391 +496,18 @@ def toggle_nearby(state: Dict[str, Any], args: argparse.Namespace | None = None)
         except Exception:
             pass
         return "Nearby on"
+
+    # Disabling: evict dynamically added stations so we stop tracking/polling them.
+    evicted = evict_dynamic_sites(state)
+    if evicted:
+        for gid in evicted:
+            SITE_MAP.pop(gid, None)
+            STATION_LOCATIONS.pop(gid, None)
+    meta.pop("nearby_gauges", None)
+    meta.pop("nearby_search_ts", None)
+    if evicted:
+        return f"Nearby off (evicted {len(evicted)})"
     return "Nearby off"
-
-
-def _snap_delta_to_cadence(delta_sec: float) -> tuple[float | None, int | None]:
-    """
-    Snap an observed update delta to the nearest 15-minute multiple.
-
-    Returns (snapped_delta, k) where k is the multiple of CADENCE_BASE_SEC.
-    If the delta is not close enough to a multiple, returns (None, None).
-    """
-    if delta_sec <= 0:
-        return None, None
-    k = int(round(delta_sec / CADENCE_BASE_SEC))
-    if k < 1:
-        return None, None
-    snapped = float(k * CADENCE_BASE_SEC)
-    if abs(snapped - delta_sec) <= CADENCE_SNAP_TOL_SEC:
-        return snapped, k
-    return None, None
-
-
-def _estimate_cadence_multiple(deltas_sec: List[float]) -> tuple[int | None, float]:
-    """
-    Estimate the underlying cadence multiple k (where cadence = k*CADENCE_BASE_SEC)
-    from a list of observed deltas.
-
-    The estimator is robust to missed updates: it chooses the largest k such that
-    a high fraction of deltas are integer multiples of k.
-    Returns (k, fit_fraction). k is None when confidence is low.
-    """
-    k_samples: List[int] = []
-    for d in deltas_sec:
-        snapped, k = _snap_delta_to_cadence(d)
-        if snapped is None or k is None:
-            continue
-        k_samples.append(k)
-
-    if len(k_samples) < 3:
-        return None, 0.0
-
-    max_k = max(k_samples)
-    best_k = 1
-    best_fit = 0.0
-    n = float(len(k_samples))
-    for cand in range(1, max_k + 1):
-        fit = sum(1 for k in k_samples if (k % cand) == 0) / n
-        if fit > best_fit + 1e-9 or (abs(fit - best_fit) <= 1e-9 and cand > best_k):
-            best_fit = fit
-            best_k = cand
-
-    if best_fit >= CADENCE_FIT_THRESHOLD:
-        return best_k, best_fit
-    return None, best_fit
-
-
-def _maybe_update_cadence_from_deltas(g_state: Dict[str, Any]) -> None:
-    """
-    If recent deltas strongly support a 15-minute multiple cadence, snap the
-    gauge's mean_interval_sec to that multiple and record confidence.
-    If confidence falls below CADENCE_CLEAR_THRESHOLD, clear the multiple so
-    the EWMA can adapt to irregular behavior.
-    """
-    deltas = g_state.get("deltas")
-    if not isinstance(deltas, list) or not deltas:
-        return
-    clean = [float(d) for d in deltas if isinstance(d, (int, float)) and d >= MIN_UPDATE_GAP_SEC]
-    if len(clean) < 3:
-        return
-
-    k, fit = _estimate_cadence_multiple(clean[-HISTORY_LIMIT:])
-    if k is not None:
-        g_state["cadence_mult"] = int(k)
-        g_state["cadence_fit"] = float(fit)
-        g_state["mean_interval_sec"] = float(k * CADENCE_BASE_SEC)
-    else:
-        g_state["cadence_fit"] = float(fit)
-        if fit < CADENCE_CLEAR_THRESHOLD and "cadence_mult" in g_state:
-            g_state.pop("cadence_mult", None)
-
-
-def _estimate_phase_offset_sec(g_state: Dict[str, Any]) -> float | None:
-    """
-    Estimate a stable phase offset for a snapped cadence.
-
-    We treat observation timestamps as lying on a grid of period
-    mean_interval_sec, and estimate the typical offset within that period.
-    Returns phase in seconds within [0, cadence).
-    """
-    mean_interval = g_state.get("mean_interval_sec")
-    if not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
-        return None
-    cadence = float(mean_interval)
-    cad_mult = g_state.get("cadence_mult")
-    if not isinstance(cad_mult, int) or cad_mult <= 0:
-        return None
-
-    history = g_state.get("history", []) or []
-    if not isinstance(history, list) or len(history) < 3:
-        return None
-
-    offsets: List[float] = []
-    seed: float | None = None
-    for entry in history[-HISTORY_LIMIT:]:
-        if not isinstance(entry, dict):
-            continue
-        ts_raw = entry.get("ts")
-        if not isinstance(ts_raw, str):
-            continue
-        dt = _parse_timestamp(ts_raw)
-        if dt is None:
-            continue
-        off = dt.timestamp() % cadence
-        if seed is None:
-            seed = off
-        # Unwrap to be near the seed.
-        if seed is not None:
-            if off - seed > cadence / 2:
-                off -= cadence
-            elif seed - off > cadence / 2:
-                off += cadence
-        offsets.append(off)
-
-    if not offsets or seed is None:
-        return None
-
-    # Robust location on unwrapped offsets.
-    loc, scale = tukey_biweight_location_scale(
-        offsets,
-        initial_loc=float(seed),
-        initial_scale=float(CADENCE_SNAP_TOL_SEC),
-    )
-    phase = float(loc % cadence)
-    g_state["phase_offset_sec"] = phase
-    g_state["phase_scale_sec"] = float(scale)
-    return phase
-
-
-class StateLockError(RuntimeError):
-    pass
-
-
-class _StateFileLock:
-    """
-    Best-effort single-writer lock for a given state file.
-
-    Uses a sibling `.lock` file and `fcntl.flock` when available. On platforms
-    without `fcntl` (e.g., Windows, Pyodide), this becomes a no-op.
-    """
-
-    def __init__(self, state_path: Path) -> None:
-        self._lock_path = state_path.with_suffix(state_path.suffix + ".lock")
-        self._fh = None
-
-    def __enter__(self) -> "_StateFileLock":
-        if fcntl is None:
-            return self
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = self._lock_path.open("w", encoding="utf-8")
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except Exception as exc:
-            fh.close()
-            raise StateLockError(
-                f"State file is locked by another streamvis process: {self._lock_path}"
-            ) from exc
-        self._fh = fh
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self._fh is None or fcntl is None:
-            return
-        try:
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        try:
-            self._fh.close()
-        except Exception:
-            pass
-        self._fh = None
-
-
-def state_lock(state_path: Path) -> contextlib.AbstractContextManager:
-    """
-    Return a context manager that holds a single-writer lock for `state_path`.
-    On platforms without file-lock support this is a no-op.
-    """
-    if fcntl is None:
-        return contextlib.nullcontext()
-    return _StateFileLock(state_path)
-
-
-def load_state(state_path: Path) -> Dict[str, Any]:
-    try:
-        with state_path.open("r", encoding="utf-8") as fh:
-            state = json.load(fh)
-    except Exception:
-        state = {"gauges": {}, "meta": {}}
-    if not isinstance(state, dict):
-        state = {"gauges": {}, "meta": {}}
-    state.setdefault("gauges", {})
-    state.setdefault("meta", {})
-    meta = state.get("meta", {})
-    if not isinstance(meta, dict):
-        meta = {}
-        state["meta"] = meta
-    version = meta.get("state_version")
-    if not isinstance(version, int) or version <= 0:
-        meta["state_version"] = STATE_SCHEMA_VERSION
-    _cleanup_state(state)
-    return state
-
-
-def _slim_state_for_browser(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Create a smaller persistence-friendly subset of state for browser localStorage.
-
-    This is used only as a fallback when a full JSON write exceeds localStorage
-    quotas (notably on iOS Safari). It prioritizes keeping cadence/latency
-    learning and the latest readings, while dropping bulky forecast overlays and
-    trimming histories.
-    """
-    slim: Dict[str, Any] = {"gauges": {}, "meta": {}}
-    meta = state.get("meta")
-    if isinstance(meta, dict):
-        slim["meta"] = dict(meta)
-
-    gauges_state = state.get("gauges", {})
-    if not isinstance(gauges_state, dict):
-        return slim
-
-    keep_scalar_keys = (
-        "last_timestamp",
-        "last_poll_ts",
-        "last_stage",
-        "last_flow",
-        "mean_interval_sec",
-        "cadence_mult",
-        "cadence_fit",
-        "phase_offset_sec",
-        "latency_loc_sec",
-        "latency_scale_sec",
-        "polls_per_update_ewma",
-        "last_polls_per_update",
-        "no_update_polls",
-    )
-    keep_series_keys = (
-        "history",
-        "deltas",
-        "latencies_sec",
-        "latency_lower_sec",
-        "latency_upper_sec",
-    )
-    series_limit = 60
-
-    out_gauges: Dict[str, Any] = {}
-    for gauge_id, g_state in gauges_state.items():
-        if not isinstance(gauge_id, str) or not isinstance(g_state, dict):
-            continue
-        out: Dict[str, Any] = {}
-        for key in keep_scalar_keys:
-            if key in g_state:
-                out[key] = g_state[key]
-        for key in keep_series_keys:
-            vals = g_state.get(key)
-            if isinstance(vals, list) and vals:
-                out[key] = vals[-series_limit:]
-        out_gauges[gauge_id] = out
-
-    slim["gauges"] = out_gauges
-    return slim
-
-
-def save_state(state_path: Path, state: Dict[str, Any]) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    meta = state.setdefault("meta", {})
-    if isinstance(meta, dict):
-        meta.setdefault("state_version", STATE_SCHEMA_VERSION)
-    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2, sort_keys=True)
-    tmp_path.replace(state_path)
-    # In browser/Pyodide builds, keep localStorage in sync on every save so a
-    # reload mid-run does not discard learned cadence/latency state.
-    try:
-        import js  # type: ignore[import]
-    except Exception:
-        js = None  # type: ignore[assignment]
-    if js is not None:
-        serialized = json.dumps(state, separators=(",", ":"), sort_keys=True)
-        try:
-            js.window.localStorage.setItem("streamvis_state_json", serialized)
-        except Exception:
-            # If iOS/Safari quota is tight, fall back to a slimmed state that
-            # preserves cadence/latency learning but drops bulky overlays.
-            try:
-                slim = _slim_state_for_browser(state)
-                js.window.localStorage.setItem(
-                    "streamvis_state_json",
-                    json.dumps(slim, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception:
-                pass
-
-
-def _cleanup_state(state: Dict[str, Any]) -> None:
-    """
-    Normalize and de-duplicate cached state so that:
-    - history has at most one entry per timestamp
-    - last_timestamp aligns with the latest history entry
-    - we never keep more than HISTORY_LIMIT points per gauge
-    """
-    gauges_state = state.get("gauges", {})
-    if not isinstance(gauges_state, dict):
-        state["gauges"] = {}
-        return
-
-    for g_state in gauges_state.values():
-        if not isinstance(g_state, dict):
-            continue
-        history = g_state.get("history")
-        if isinstance(history, list) and history:
-            # De-duplicate by timestamp, keeping the most recent entry.
-            by_ts: Dict[str, Dict[str, Any]] = {}
-            for entry in history:
-                if not isinstance(entry, dict):
-                    continue
-                ts = entry.get("ts")
-                if isinstance(ts, str):
-                    by_ts[ts] = entry
-            if by_ts:
-                ordered = sorted(by_ts.items(), key=lambda kv: kv[0])
-                trimmed = ordered[-HISTORY_LIMIT:]
-                g_state["history"] = [e for _, e in trimmed]
-                latest_ts = trimmed[-1][0]
-                g_state["last_timestamp"] = latest_ts
-                latest = trimmed[-1][1]
-                if "stage" in latest:
-                    g_state["last_stage"] = latest["stage"]
-                if "flow" in latest:
-                    g_state["last_flow"] = latest["flow"]
-        # Clamp learned interval into sane bounds.
-        mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-        if not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
-            mean_interval = DEFAULT_INTERVAL_SEC
-        mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
-        cad_mult = g_state.get("cadence_mult")
-        if isinstance(cad_mult, int) and cad_mult > 0:
-            snapped = cad_mult * CADENCE_BASE_SEC
-            mean_interval = max(MIN_UPDATE_GAP_SEC, min(float(snapped), MAX_LEARNABLE_INTERVAL_SEC))
-        g_state["mean_interval_sec"] = mean_interval
-
-        # Clamp any stored latency stats.
-        latencies = g_state.get("latencies_sec")
-        if isinstance(latencies, list):
-            clean_lat = [float(x) for x in latencies if isinstance(x, (int, float)) and x >= 0]
-            if clean_lat:
-                g_state["latencies_sec"] = clean_lat[-HISTORY_LIMIT:]
-            else:
-                g_state.pop("latencies_sec", None)
-
-        # Initialize/normalize robust latency location/scale.
-        loc = g_state.get("latency_loc_sec")
-        scale = g_state.get("latency_scale_sec")
-        if not isinstance(loc, (int, float)) or loc < 0:
-            loc_old = g_state.get("latency_median_sec")
-            loc = float(loc_old) if isinstance(loc_old, (int, float)) and loc_old >= 0 else LATENCY_PRIOR_LOC_SEC
-        if not isinstance(scale, (int, float)) or scale < 0:
-            scale_old = g_state.get("latency_mad_sec")
-            scale = (
-                float(scale_old)
-                if isinstance(scale_old, (int, float)) and scale_old >= 0
-                else LATENCY_PRIOR_SCALE_SEC
-            )
-        g_state["latency_loc_sec"] = float(loc)
-        g_state["latency_scale_sec"] = float(scale)
-
-        for key in ("latency_lower_sec", "latency_upper_sec"):
-            vals = g_state.get(key)
-            if isinstance(vals, list):
-                clean = [float(x) for x in vals if isinstance(x, (int, float)) and x >= 0]
-                if clean:
-                    g_state[key] = clean[-HISTORY_LIMIT:]
-                else:
-                    g_state.pop(key, None)
 
 
 def fetch_gauge_history(hours_back: int) -> Dict[str, List[Dict[str, Any]]]:
@@ -962,199 +519,11 @@ def fetch_gauge_history(hours_back: int) -> Dict[str, List[Dict[str, Any]]]:
     """
     if hours_back <= 0:
         return {}
-
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=hours_back)
-
-    params = {
-        "format": "json",
-        "sites": ",".join(SITE_MAP.values()),
-        "parameterCd": "00060,00065",   # discharge, stage
-        "siteStatus": "all",
-        "startDT": start.isoformat(timespec="minutes").replace("+00:00", "Z"),
-        "endDT": end.isoformat(timespec="minutes").replace("+00:00", "Z"),
-    }
-
     try:
-        payload = get_json(USGS_IV_URL, params=params, timeout=10.0)
+        # WaterServices remains the preferred historical API for now.
+        return _usgs_fetch_gauge_history(SITE_MAP, hours_back, backend=USGSBackend.WATERSERVICES)
     except Exception:
         return {}
-
-    site_to_gauge = {v: k for k, v in SITE_MAP.items()}
-    by_gauge: Dict[str, Dict[str, Dict[str, Any]]] = {
-        g: {} for g in SITE_MAP.keys()
-    }
-
-    ts_list = payload.get("value", {}).get("timeSeries", [])
-    for ts in ts_list:
-        try:
-            site_no = ts["sourceInfo"]["siteCode"][0]["value"]
-            param = ts["variable"]["variableCode"][0]["value"]  # '00060' or '00065'
-            gauge_id = site_to_gauge.get(site_no)
-            if gauge_id is None:
-                continue
-
-            values = ts.get("values", [])
-            if not values or not values[0].get("value"):
-                continue
-        except Exception:
-            continue
-
-        for point in values[0]["value"]:
-            try:
-                val = float(point["value"])
-                ts_raw = point.get("dateTime")
-                obs_at = _parse_timestamp(ts_raw)
-                if obs_at is None:
-                    continue
-                ts_key = obs_at.isoformat()
-            except Exception:
-                continue
-
-            entry = by_gauge[gauge_id].setdefault(
-                ts_key, {"ts": ts_key, "stage": None, "flow": None}
-            )
-            if param == "00060":
-                entry["flow"] = val
-            elif param == "00065":
-                entry["stage"] = val
-
-    result: Dict[str, List[Dict[str, Any]]] = {}
-    for gauge_id, points_by_ts in by_gauge.items():
-        if not points_by_ts:
-            continue
-        ordered = sorted(points_by_ts.items(), key=lambda kv: kv[0])
-        result[gauge_id] = [entry for _, entry in ordered]
-
-    return result
-
-
-def backfill_state_with_history(state: Dict[str, Any], history_map: Dict[str, List[Dict[str, Any]]]) -> None:
-    """
-    Merge backfilled history into the existing state, enforcing:
-    - at most one point per timestamp
-    - at most HISTORY_LIMIT points per gauge
-    - a reasonable learned cadence from the observed deltas
-    """
-    gauges_state = state.setdefault("gauges", {})
-
-    for gauge_id, points in history_map.items():
-        if not points:
-            continue
-        g_state = gauges_state.setdefault(gauge_id, {})
-        existing_history = g_state.get("history", [])
-        combined: Dict[str, Dict[str, Any]] = {}
-
-        if isinstance(existing_history, list):
-            for entry in existing_history:
-                if isinstance(entry, dict) and isinstance(entry.get("ts"), str):
-                    combined[entry["ts"]] = entry
-
-        for p in points:
-            ts = p.get("ts")
-            if isinstance(ts, str):
-                combined[ts] = {
-                    "ts": ts,
-                    "stage": p.get("stage"),
-                    "flow": p.get("flow"),
-                }
-
-        if not combined:
-            continue
-
-        ordered_ts = sorted(combined.keys())
-        trimmed_ts = ordered_ts[-HISTORY_LIMIT:]
-        new_history = [combined[ts] for ts in trimmed_ts]
-        g_state["history"] = new_history
-
-        latest = new_history[-1]
-        latest_ts = latest.get("ts")
-        if isinstance(latest_ts, str):
-            g_state["last_timestamp"] = latest_ts
-        if "stage" in latest:
-            g_state["last_stage"] = latest["stage"]
-        if "flow" in latest:
-            g_state["last_flow"] = latest["flow"]
-
-        # Estimate cadence from deltas.
-        deltas: List[float] = []
-        prev_dt: datetime | None = None
-        for entry in new_history:
-            ts = entry.get("ts")
-            if not isinstance(ts, str):
-                continue
-            dt = _parse_timestamp(ts)
-            if dt is None:
-                continue
-            if prev_dt is not None:
-                delta = (dt - prev_dt).total_seconds()
-                if delta >= MIN_UPDATE_GAP_SEC:
-                    deltas.append(delta)
-            prev_dt = dt
-
-        if deltas:
-            mean_interval = sum(deltas) / len(deltas)
-            mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
-            g_state["mean_interval_sec"] = mean_interval
-            g_state["last_delta_sec"] = deltas[-1]
-            g_state["deltas"] = deltas[-HISTORY_LIMIT:]
-            _maybe_update_cadence_from_deltas(g_state)
-        else:
-            mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-            mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
-            g_state["mean_interval_sec"] = mean_interval
-
-
-def maybe_backfill_state(state: Dict[str, Any], hours_back: int) -> None:
-    """
-    Backfill state once per requested horizon; if a larger horizon is requested
-    later, it will extend the history.
-    """
-    if hours_back <= 0:
-        return
-
-    meta = state.setdefault("meta", {})
-    previous = meta.get("backfill_hours", 0)
-    if isinstance(previous, (int, float)) and previous >= hours_back:
-        return
-
-    history_map = fetch_gauge_history(hours_back)
-    if not history_map:
-        return
-
-    backfill_state_with_history(state, history_map)
-    meta["backfill_hours"] = max(int(previous or 0), int(hours_back))
-
-
-def maybe_periodic_backfill_check(
-    state: Dict[str, Any],
-    now: datetime,
-    lookback_hours: int = PERIODIC_BACKFILL_LOOKBACK_HOURS,
-) -> None:
-    """
-    Occasionally re-fetch a recent history window to detect missed updates
-    or cadence shifts.
-
-    This is intentionally low-frequency (hours) and uses a modest lookback
-    window so it remains polite while improving low-latency accuracy.
-    """
-    if lookback_hours <= 0:
-        return
-    meta = state.setdefault("meta", {})
-    if not isinstance(meta, dict):
-        return
-    last_check = _parse_timestamp(meta.get("last_backfill_check")) if isinstance(meta.get("last_backfill_check"), str) else None
-    if last_check is not None:
-        elapsed = (now - last_check).total_seconds()
-        if elapsed < PERIODIC_BACKFILL_INTERVAL_HOURS * 3600:
-            return
-
-    history_map = fetch_gauge_history(lookback_hours)
-    if history_map:
-        backfill_state_with_history(state, history_map)
-
-    meta["last_backfill_check"] = now.isoformat()
-
 
 def _resolve_forecast_url(template: str, gauge_id: str, site_no: str) -> str:
     """
@@ -1195,18 +564,6 @@ def _forecast_template_for_gauge(gauge_id: str, site_no: str, args: argparse.Nam
                 return template
 
     return ""
-
-
-def _coerce_float(val: Any) -> float | None:
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
-        try:
-            return float(val)
-        except Exception:
-            return None
-    return None
-
 
 def fetch_forecast_series(
     forecast_base: str,
@@ -1882,189 +1239,7 @@ def update_state_with_readings(
     readings: Dict[str, Dict[str, Any]],
     poll_ts: datetime | None = None,
 ) -> Dict[str, bool]:
-    """
-    Update persisted state with latest observations and learn per-gauge cadence.
-    Returns a dict of gauge_id -> bool indicating whether a new observation was seen.
-    """
-    seen_updates: Dict[str, bool] = {}
-    gauges_state = state.setdefault("gauges", {})
-    meta_state = state.setdefault("meta", {})
-    now = poll_ts or datetime.now(timezone.utc)
-
-    for gauge_id, reading in readings.items():
-        observed_at: datetime | None = reading.get("observed_at")
-        if observed_at is None:
-            seen_updates[gauge_id] = False
-            continue
-
-        g_state = gauges_state.setdefault(gauge_id, {})
-        prev_ts = _parse_timestamp(g_state.get("last_timestamp"))
-        prev_poll_ts = _parse_timestamp(g_state.get("last_poll_ts"))
-        prev_mean = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-        last_delta = g_state.get("last_delta_sec")
-        no_update_polls = g_state.get("no_update_polls", 0)
-        is_update = False
-        delta_sec: float | None = None
-
-        # Only treat strictly newer observation timestamps as updates.
-        if prev_ts is not None and observed_at <= prev_ts:
-            # No new point; keep existing cadence and history as-is.
-            seen_updates[gauge_id] = False
-            # Still keep last known values in sync with the latest reading.
-            stage_now = reading.get("stage")
-            flow_now = reading.get("flow")
-            if stage_now is not None:
-                g_state["last_stage"] = stage_now
-            if flow_now is not None:
-                g_state["last_flow"] = flow_now
-
-            # If this reading shares the same timestamp as our last stored
-            # point (e.g., one parameter was updated slightly later by USGS),
-            # refresh the last history entry so the table reflects the
-            # latest stage/flow pair rather than freezing the older value.
-            if prev_ts is not None and observed_at == prev_ts:
-                history = g_state.get("history")
-                if isinstance(history, list) and history:
-                    last_entry = history[-1]
-                    ts_str = last_entry.get("ts")
-                    if isinstance(ts_str, str) and _parse_timestamp(ts_str) == observed_at:
-                        if stage_now is not None:
-                            last_entry["stage"] = stage_now
-                        if flow_now is not None:
-                            last_entry["flow"] = flow_now
-
-            g_state["no_update_polls"] = int(no_update_polls) + 1
-            # Record the time of this poll so future latency windows can use it
-            # as the last "no-update" bound.
-            g_state["last_poll_ts"] = now.isoformat()
-            continue
-
-        if prev_ts is not None and observed_at > prev_ts:
-            delta_sec = (observed_at - prev_ts).total_seconds()
-            if delta_sec >= MIN_UPDATE_GAP_SEC:
-                clamped = min(max(delta_sec, MIN_UPDATE_GAP_SEC), MAX_LEARNABLE_INTERVAL_SEC)
-                snapped, _k = _snap_delta_to_cadence(clamped)
-                if snapped is not None:
-                    prev_mean = _ewma(prev_mean, snapped)
-                else:
-                    prev_mean = _ewma(prev_mean, clamped)
-                last_delta = delta_sec
-                is_update = True
-        elif prev_ts is None:
-            is_update = True
-
-        g_state["last_timestamp"] = observed_at.isoformat()
-        g_state["mean_interval_sec"] = max(prev_mean, MIN_UPDATE_GAP_SEC)
-        if last_delta is not None:
-            g_state["last_delta_sec"] = last_delta
-        stage_now = reading.get("stage")
-        flow_now = reading.get("flow")
-        if stage_now is not None:
-            g_state["last_stage"] = stage_now
-        if flow_now is not None:
-            g_state["last_flow"] = flow_now
-        history = g_state.setdefault("history", [])
-        # Append at most one history point per new observation timestamp.
-        if not history or history[-1].get("ts") != observed_at.isoformat():
-            history.append(
-                {
-                    "ts": observed_at.isoformat(),
-                    "stage": stage_now,
-                    "flow": flow_now,
-                }
-            )
-        if len(history) > HISTORY_LIMIT:
-            del history[0 : len(history) - HISTORY_LIMIT]
-
-        # Instrumentation: how many polls did it take to observe this update?
-        # We treat strictly newer timestamps as updates; same-timestamp
-        # parameter refreshes do not count.
-        if is_update:
-            polls_since_update = int(no_update_polls) if isinstance(no_update_polls, (int, float)) else 0
-            polls_this_update = polls_since_update + 1
-            prev_polls_ewma = g_state.get("polls_per_update_ewma")
-            if isinstance(prev_polls_ewma, (int, float)) and prev_polls_ewma > 0:
-                g_state["polls_per_update_ewma"] = _ewma(float(prev_polls_ewma), float(polls_this_update))
-            else:
-                g_state["polls_per_update_ewma"] = float(polls_this_update)
-            g_state["last_polls_per_update"] = polls_this_update
-
-        if is_update and last_delta is not None:
-            deltas = g_state.setdefault("deltas", [])
-            deltas.append(last_delta)
-            if len(deltas) > HISTORY_LIMIT:
-                del deltas[0 : len(deltas) - HISTORY_LIMIT]
-            _maybe_update_cadence_from_deltas(g_state)
-            _estimate_phase_offset_sec(g_state)
-
-            # If we do not have a strong cadence multiple yet, ensure that a slow
-            # gauge can still snap upward quickly from the prior.
-            if "cadence_mult" not in g_state and len(deltas) >= 3:
-                avg_delta = sum(deltas) / len(deltas)
-                mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-                if isinstance(mean_interval, (int, float)) and mean_interval < 0.75 * avg_delta:
-                    mean_interval = max(MIN_UPDATE_GAP_SEC, min(avg_delta, MAX_LEARNABLE_INTERVAL_SEC))
-                    g_state["mean_interval_sec"] = mean_interval
-
-            # Latency window: when did this observation appear in the API?
-            # Lower bound: last poll where it was *not* yet visible.
-            # Upper bound: this poll where it *is* visible.
-            lower = 0.0
-            if prev_poll_ts is not None:
-                lower = max(0.0, (prev_poll_ts - observed_at).total_seconds())
-            upper = max(0.0, (now - observed_at).total_seconds())
-
-            lat_l = g_state.setdefault("latency_lower_sec", [])
-            lat_u = g_state.setdefault("latency_upper_sec", [])
-            lat_l.append(lower)
-            lat_u.append(upper)
-            if len(lat_l) > HISTORY_LIMIT:
-                del lat_l[0 : len(lat_l) - HISTORY_LIMIT]
-            if len(lat_u) > HISTORY_LIMIT:
-                del lat_u[0 : len(lat_u) - HISTORY_LIMIT]
-
-            # Primary latency samples.
-            samples = g_state.setdefault("latencies_sec", [])
-            prior_loc = g_state.get("latency_loc_sec")
-            if not isinstance(prior_loc, (int, float)) or prior_loc < 0:
-                prior_loc = g_state.get("latency_median_sec", LATENCY_PRIOR_LOC_SEC)
-            prior_scale = g_state.get("latency_scale_sec")
-            if not isinstance(prior_scale, (int, float)) or prior_scale <= 0:
-                prior_scale = g_state.get("latency_mad_sec", LATENCY_PRIOR_SCALE_SEC)
-
-            # Most likely latency within the visibility window, informed by our prior.
-            sample = min(max(float(prior_loc), lower), upper)
-            samples.append(sample)
-            # Persist the latest window/sample for optional community publishing.
-            g_state["last_latency_lower_sec"] = float(lower)
-            g_state["last_latency_upper_sec"] = float(upper)
-            g_state["last_latency_sample_sec"] = float(sample)
-            if len(samples) > HISTORY_LIMIT:
-                del samples[0 : len(samples) - HISTORY_LIMIT]
-
-            if len(samples) < 3:
-                loc = float(prior_loc)
-                scale = float(prior_scale)
-            else:
-                loc, scale = tukey_biweight_location_scale(
-                    samples,
-                    initial_loc=float(prior_loc),
-                    initial_scale=float(prior_scale),
-                )
-            g_state["latency_loc_sec"] = loc
-            g_state["latency_scale_sec"] = scale
-
-            # Reset the consecutive no-update counter now that we saw a new point.
-            g_state["no_update_polls"] = 0
-
-        # Record the time of this poll for future latency windows.
-        g_state["last_poll_ts"] = now.isoformat()
-
-        seen_updates[gauge_id] = is_update
-
-    meta_state["last_update_run"] = datetime.now(timezone.utc).isoformat()
-
-    return seen_updates
+    return _streamvis_state.update_state_with_readings(state, readings, poll_ts=poll_ts)
 
 
 def predict_next_poll(state: Dict[str, Any], now: datetime) -> datetime:
@@ -2076,43 +1251,7 @@ def predict_next_poll(state: Dict[str, Any], now: datetime) -> datetime:
 
 
 def predict_gauge_next(state: Dict[str, Any], gauge_id: str, now: datetime) -> datetime | None:
-    gauges_state = state.get("gauges", {})
-    g_state = gauges_state.get(gauge_id)
-    if not g_state:
-        return None
-    last_ts = _parse_timestamp(g_state.get("last_timestamp"))
-    mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-    if last_ts is None:
-        return None
-    # Clamp learned interval into the same sane bounds used elsewhere.
-    mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
-
-    cadence = float(mean_interval)
-
-    phase = g_state.get("phase_offset_sec")
-    if not isinstance(phase, (int, float)) or phase < 0 or phase >= cadence:
-        phase = _estimate_phase_offset_sec(g_state)
-
-    if isinstance(phase, (int, float)):
-        base_t = max(last_ts.timestamp(), now.timestamp())
-        k = math.floor((base_t - float(phase)) / cadence) + 1
-        next_obs_t = k * cadence + float(phase)
-        next_obs = datetime.fromtimestamp(next_obs_t, tz=timezone.utc)
-    else:
-        # Fallback: predict relative to last observation.
-        delta_since_last = (now - last_ts).total_seconds()
-        if delta_since_last <= 0 or delta_since_last <= 2 * cadence:
-            next_obs = last_ts + timedelta(seconds=cadence)
-        else:
-            multiples = max(1, math.ceil(delta_since_last / cadence))
-            next_obs = last_ts + timedelta(seconds=cadence * multiples)
-
-    # Add a robust latency estimate (time from observation to appearance in API).
-    latency_loc = g_state.get("latency_loc_sec")
-    if not isinstance(latency_loc, (int, float)) or latency_loc < 0:
-        latency_loc = g_state.get("latency_median_sec", LATENCY_PRIOR_LOC_SEC)
-
-    return next_obs + timedelta(seconds=float(latency_loc))
+    return _streamvis_scheduler.predict_gauge_next(state, gauge_id, now)
 
 
 def schedule_next_poll(
@@ -2120,136 +1259,19 @@ def schedule_next_poll(
     now: datetime,
     min_retry_seconds: int,
 ) -> datetime:
-    """
-    Choose the next time to poll USGS IV, using:
-    - Per-gauge observation cadence (mean_interval_sec)
-    - Per-gauge latency stats (median & MAD)
-    - A two-regime strategy:
-      * Coarse polling far from the expected update time.
-      * Short bursts of finer polling inside a narrow latency window
-        for gauges with stable, low-variance latency.
-    This function governs *normal* cadence; error backoff is handled separately.
-    """
-    gauges_state = state.get("gauges", {})
-    if not isinstance(gauges_state, dict) or not gauges_state:
-        return now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
-
-    best_time: datetime | None = None
-
-    for gauge_id in SITE_MAP.keys():
-        g_state = gauges_state.get(gauge_id, {})
-        if not isinstance(g_state, dict):
-            continue
-
-        last_ts = _parse_timestamp(g_state.get("last_timestamp"))
-        mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
-        if last_ts is None or not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
-            continue
-
-        mean_interval = max(MIN_UPDATE_GAP_SEC, min(mean_interval, MAX_LEARNABLE_INTERVAL_SEC))
-        next_api = predict_gauge_next(state, gauge_id, now)
-        if next_api is None:
-            continue
-
-        latency_scale = g_state.get("latency_scale_sec")
-        if not isinstance(latency_scale, (int, float)) or latency_scale < 0:
-            latency_scale = g_state.get("latency_mad_sec")
-        fine_eligible = (
-            isinstance(latency_scale, (int, float))
-            and latency_scale > 0
-            and latency_scale <= FINE_LATENCY_MAD_MAX_SEC
-            and mean_interval <= 3600
-        )
-
-        if fine_eligible:
-            lat_width = max(FINE_WINDOW_MIN_SEC, 2.0 * float(latency_scale))
-            fine_start = next_api - timedelta(seconds=lat_width)
-            fine_end = next_api + timedelta(seconds=lat_width)
-
-            if fine_start <= now <= fine_end:
-                # Inside the fine window: poll more frequently, but only as
-                # fast as the latency stability justifies.
-                fine_step = max(
-                    FINE_STEP_MIN_SEC,
-                    min(FINE_STEP_MAX_SEC, lat_width / 4.0),
-                )
-                candidate = now + timedelta(seconds=fine_step)
-            else:
-                # Coarse region around a known fine window: walk towards it.
-                coarse_step = max(
-                    min_retry_seconds,
-                    mean_interval * COARSE_STEP_FRACTION,
-                )
-                target = fine_start if now < fine_start else next_api
-                candidate = max(
-                    now + timedelta(seconds=min_retry_seconds),
-                    min(target - timedelta(seconds=HEADSTART_SEC), now + timedelta(seconds=coarse_step)),
-                )
-        else:
-            # No stable latency yet: use a simple coarse strategy around
-            # the predicted next API time.
-            coarse_step = max(
-                min_retry_seconds,
-                mean_interval * COARSE_STEP_FRACTION,
-            )
-            candidate = max(
-                now + timedelta(seconds=min_retry_seconds),
-                min(next_api - timedelta(seconds=HEADSTART_SEC), now + timedelta(seconds=coarse_step)),
-            )
-
-        if candidate <= now:
-            candidate = now + timedelta(seconds=min_retry_seconds)
-        if best_time is None or candidate < best_time:
-            best_time = candidate
-
-    if best_time is None:
-        best_time = now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
-
-    return best_time
+    return _streamvis_scheduler.schedule_next_poll(state, now, min_retry_seconds)
 
 
 def control_summary(state: Dict[str, Any], now: datetime) -> str:
-    """
-    Build a concise per-gauge control summary for debugging/tuning.
-    """
-    gauges_state = state.get("gauges", {})
-    if not isinstance(gauges_state, dict):
+    try:
+        return json.dumps(
+            _streamvis_scheduler.control_summary(state, now),
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        )
+    except Exception:
         return ""
-    parts: List[str] = []
-    for gauge_id in ordered_gauges():
-        g_state = gauges_state.get(gauge_id, {})
-        if not isinstance(g_state, dict):
-            continue
-        mean_interval = g_state.get("mean_interval_sec")
-        last_ts = _parse_timestamp(g_state.get("last_timestamp"))
-        next_api = predict_gauge_next(state, gauge_id, now)
-        latency_loc = g_state.get("latency_loc_sec")
-        latency_scale = g_state.get("latency_scale_sec")
-        if not isinstance(latency_loc, (int, float)):
-            latency_loc = g_state.get("latency_median_sec")
-        if not isinstance(latency_scale, (int, float)):
-            latency_scale = g_state.get("latency_mad_sec")
-        polls_ewma = g_state.get("polls_per_update_ewma")
-        fine = (
-            isinstance(latency_scale, (int, float))
-            and latency_scale > 0
-            and latency_scale <= FINE_LATENCY_MAD_MAX_SEC
-            and isinstance(mean_interval, (int, float))
-            and mean_interval <= 3600
-        )
-        mi_str = f"{int(mean_interval)}s" if isinstance(mean_interval, (int, float)) else "--"
-        lat_str = (
-            f"{int(latency_loc)}±{int(latency_scale)}s"
-            if isinstance(latency_loc, (int, float)) and isinstance(latency_scale, (int, float))
-            else "--"
-        )
-        next_str = _fmt_rel(now, next_api) if next_api else "unknown"
-        polls_str = f"{polls_ewma:.2f}" if isinstance(polls_ewma, (int, float)) else "--"
-        last_str = last_ts.isoformat() if last_ts else "--"
-        parts.append(
-            f"{gauge_id}: mean {mi_str} last {last_str} next {next_str} lat {lat_str} fine {fine} calls/upd {polls_str}"
-        )
-    return " | ".join(parts)
 
 
 def _history_values(state: Dict[str, Any], gauge_id: str, metric: str, limit: int = HISTORY_LIMIT) -> List[float]:
@@ -2285,6 +1307,51 @@ def _render_sparkline(values: List[float], width: int = 48) -> str:
         line.append(chars[level])
     return "".join(line)
 
+def _unique_gauge_ids(items: Any) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    if not isinstance(items, list):
+        return out
+    for it in items:
+        if not isinstance(it, str) or not it:
+            continue
+        if it in seen:
+            continue
+        seen.add(it)
+        out.append(it)
+    return out
+
+
+def compute_table_gauges(state: Dict[str, Any]) -> tuple[List[str], int | None]:
+    """
+    Return gauges in display order and an optional divider index.
+
+    When Nearby is enabled and we have a cached `meta.nearby_gauges` list, we
+    group those gauges at the bottom of the main table (without duplicates) and
+    return a divider index between the static and nearby sections.
+    """
+    gauges = ordered_gauges()
+
+    meta = state.get("meta", {})
+    if not isinstance(meta, dict) or not bool(meta.get("nearby_enabled")):
+        return gauges, None
+
+    nearby_ids = _unique_gauge_ids(meta.get("nearby_gauges"))
+    if not nearby_ids:
+        return gauges, None
+
+    nearby_ids = [gid for gid in nearby_ids if gid in SITE_MAP]
+    if not nearby_ids:
+        return gauges, None
+
+    nearby_set = set(nearby_ids)
+    static = [g for g in gauges if g not in nearby_set]
+    combined = static + nearby_ids
+    divider_index = len(static)
+    if divider_index <= 0 or divider_index >= len(combined):
+        return combined, None
+    return combined, divider_index
+
 
 def render_table(readings: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> None:
     now = datetime.now(timezone.utc)
@@ -2299,8 +1366,10 @@ def render_table(readings: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> 
     print(header)
     print("-" * len(header))
 
-    gauges = ordered_gauges()
-    for gauge_id in gauges:
+    gauges, divider_index = compute_table_gauges(state)
+    for idx, gauge_id in enumerate(gauges):
+        if divider_index is not None and idx == divider_index:
+            print(f"-- Nearby --".center(len(header), "-"))
         reading = readings.get(gauge_id, {})
         stage = reading.get("stage")
         flow = reading.get("flow")
@@ -2343,6 +1412,7 @@ def draw_screen(
     stdscr: Any,
     curses_mod: Any,
     gauges: List[str],
+    divider_index: int | None,
     readings: Dict[str, Dict[str, Any]],
     state: Dict[str, Any],
     selected_idx: int,
@@ -2406,9 +1476,30 @@ def draw_screen(
 
     stdscr.addstr(table_start, 0, header[:max_x - 1], curses_mod.A_UNDERLINE | palette.get("normal", 0))
 
-    for row, gauge_id in enumerate(gauges, start=table_start + 1):
+    has_divider = (
+        isinstance(divider_index, int) and 0 < divider_index < len(gauges)
+    )
+    divider_row = table_start + 1 + divider_index if has_divider else None
+    if divider_row is not None and 0 <= divider_row < max_y - 3:
+        divider = "-- Nearby --"
+        try:
+            line = divider.center(max_x - 1, "-")
+        except Exception:
+            line = divider
+        stdscr.addstr(divider_row, 0, line[:max_x - 1], palette.get("dim", 0))
+
+    selected_id = None
+    if gauges and 0 <= selected_idx < len(gauges):
+        selected_id = gauges[selected_idx]
+
+    last_gauge_row: int | None = None
+    for idx, gauge_id in enumerate(gauges):
+        row = table_start + 1 + idx
+        if divider_row is not None and row >= divider_row:
+            row += 1
         if row >= max_y - 5:
             break  # leave space for detail + footer
+        last_gauge_row = row
 
         reading = readings.get(gauge_id, {})
         gauges_state = state.get("gauges", {})
@@ -2471,14 +1562,18 @@ def draw_screen(
             )
         color = color_for_status(status, palette)
 
-        if gauge_id == gauges[selected_idx]:
+        if selected_id is not None and gauge_id == selected_id:
             stdscr.addstr(row, 0, line[:max_x - 1], curses_mod.A_REVERSE | color)
         else:
             stdscr.addstr(row, 0, line[:max_x - 1], color)
 
-    detail_y = row + 2 if "row" in locals() else table_start + len(gauges) + 2
+    last_row = last_gauge_row if last_gauge_row is not None else table_start
+    detail_y = last_row + 2
     if detail_y < max_y - 2:
-        selected = gauges[selected_idx]
+        if not gauges:
+            selected = ""
+        else:
+            selected = gauges[min(selected_idx, len(gauges) - 1)]
         g_state = state.get("gauges", {}).get(selected, {})
         reading = readings.get(selected, {})
         observed_at = reading.get("observed_at") or _parse_timestamp(g_state.get("last_timestamp"))
@@ -2694,9 +1789,9 @@ def draw_screen(
                 stats = f"{chart_metric}: min {min(chart_vals):.2f}  max {max(chart_vals):.2f}  Δ {delta:+.2f}"
                 stdscr.addstr(detail_y + 5, 0, stats[:max_x - 1], palette.get("dim", 0))
 
-    # Nearby gauges section (optional).
-    nearby_enabled = bool(state.get("meta", {}).get("nearby_enabled"))
+    # Nearby toggle line (optional).
     meta = state.get("meta", {})
+    nearby_enabled = bool(meta.get("nearby_enabled")) if isinstance(meta, dict) else False
     user_lat = meta.get("user_lat") if isinstance(meta, dict) else None
     user_lon = meta.get("user_lon") if isinstance(meta, dict) else None
 
@@ -2705,61 +1800,14 @@ def draw_screen(
     if toggle_y > detail_y and 0 <= toggle_y < max_y:
         on_off = "ON" if nearby_enabled else "off"
         toggle_line = f"[n] Nearby: {on_off}"
+        if nearby_enabled and divider_index is not None:
+            n_nearby = max(0, len(gauges) - divider_index)
+            toggle_line += f" ({n_nearby} in table)"
         if nearby_enabled and not (
             isinstance(user_lat, (int, float)) and isinstance(user_lon, (int, float))
         ):
             toggle_line += " (allow location)"
         stdscr.addstr(toggle_y, 0, toggle_line[:max_x - 1], palette.get("dim", 0))
-
-        if nearby_enabled:
-            available = toggle_y - detail_y - 1
-            if available >= 2:
-                header_y = toggle_y - min(available, 4)
-                if not (
-                    isinstance(user_lat, (int, float)) and isinstance(user_lon, (int, float))
-                ):
-                    msg = "Closest stations: location unavailable"
-                    stdscr.addstr(header_y, 0, msg[:max_x - 1], palette.get("dim", 0))
-                else:
-                    ids = meta.get("nearby_gauges") if isinstance(meta, dict) else None
-                    nearest: List[tuple[str, float]] = []
-                    if isinstance(ids, list) and ids:
-                        for gid_raw in ids:
-                            if not isinstance(gid_raw, str):
-                                continue
-                            coords = STATION_LOCATIONS.get(gid_raw)
-                            if coords:
-                                dist = _haversine_miles(float(user_lat), float(user_lon), coords[0], coords[1])
-                            else:
-                                dist = float("nan")
-                            nearest.append((gid_raw, dist))
-                    else:
-                        nearest = nearest_gauges(float(user_lat), float(user_lon), n=3)
-
-                    if not nearest:
-                        stdscr.addstr(
-                            header_y,
-                            0,
-                            "Closest stations: unavailable"[:max_x - 1],
-                            palette.get("dim", 0),
-                        )
-                    else:
-                        stdscr.addstr(
-                            header_y,
-                            0,
-                            "Closest stations to you:"[:max_x - 1],
-                            palette.get("dim", 0),
-                        )
-                        max_rows = min(3, available - 1)
-                        for i, (gid, dist) in enumerate(nearest[:max_rows]):
-                            name = station_display_name(gid, state)
-                            line = f"{gid:<6s} {dist:5.1f}mi {name}"
-                            stdscr.addstr(
-                                header_y + 1 + i,
-                                0,
-                                line[:max_x - 1],
-                                palette.get("normal", 0),
-                            )
     if footer_y >= 0:
         next_multi = _fmt_rel(now, next_poll_at) if next_poll_at else "pending"
         footer = (
@@ -2852,11 +1900,14 @@ def tui_loop(args: argparse.Namespace) -> int:
 
         state_path = Path(args.state_file)
         state = load_state(state_path)
+        meta = state.setdefault("meta", {})
+        if isinstance(meta, dict):
+            meta["api_backend"] = getattr(args, "usgs_backend", "blended")
         apply_dynamic_sites_from_state(state)
         maybe_backfill_state(state, args.backfill_hours)
         maybe_refresh_community(state, args)
         seed_user_location_from_args(state, args)
-        gauges = ordered_gauges()
+        gauges, divider_index = compute_table_gauges(state)
         save_state(state_path, state)
         readings: Dict[str, Dict[str, Any]] = {}
         selected_idx = 0
@@ -2866,6 +1917,23 @@ def tui_loop(args: argparse.Namespace) -> int:
         retry_wait = args.min_retry_seconds
         detail_mode = False
         update_alert = getattr(args, "update_alert", True)
+
+        def refresh_gauges() -> None:
+            nonlocal gauges, divider_index, selected_idx
+            selected_id = None
+            if gauges and 0 <= selected_idx < len(gauges):
+                selected_id = gauges[selected_idx]
+            new_gauges, new_divider = compute_table_gauges(state)
+            if new_gauges == gauges and new_divider == divider_index:
+                return
+            gauges = new_gauges
+            divider_index = new_divider
+            if selected_id is not None and selected_id in gauges:
+                selected_idx = gauges.index(selected_id)
+            elif gauges:
+                selected_idx = min(selected_idx, len(gauges) - 1)
+            else:
+                selected_idx = 0
 
         while True:
             now = datetime.now(timezone.utc)
@@ -2923,11 +1991,13 @@ def tui_loop(args: argparse.Namespace) -> int:
                         float(loc[1]),
                         n=3,
                     )
+                    refresh_gauges()
 
             draw_screen(
                 stdscr,
                 curses,
                 gauges,
+                divider_index,
                 readings,
                 state,
                 selected_idx,
@@ -2953,16 +2023,19 @@ def tui_loop(args: argparse.Namespace) -> int:
                 toggle_row = footer_y - 1
                 if clicked_row == toggle_row:
                     status_msg = toggle_nearby(state, args)
-                    gauges = ordered_gauges()
-                    if gauges:
-                        selected_idx = min(selected_idx, len(gauges) - 1)
+                    refresh_gauges()
                     save_state(state_path, state)
                     continue
                 first_gauge_row = TUI_TABLE_START + 1
-                target = clicked_row - first_gauge_row
-                if 0 <= target < len(gauges):
+                rel = clicked_row - first_gauge_row
+                has_divider = isinstance(divider_index, int) and 0 < divider_index < len(gauges)
+                if has_divider and rel == divider_index:
+                    continue  # divider line
+                if has_divider and rel > divider_index:
+                    rel -= 1
+                if 0 <= rel < len(gauges):
                     selected_idx, detail_mode, status_msg = handle_row_click(
-                        target, selected_idx, detail_mode, gauges
+                        rel, selected_idx, detail_mode, gauges
                     )
                 continue
 
@@ -2977,9 +2050,7 @@ def tui_loop(args: argparse.Namespace) -> int:
                 status_msg = f"Chart metric: {chart_metric}"
             elif key in (ord("n"), ord("N")):
                 status_msg = toggle_nearby(state, args)
-                gauges = ordered_gauges()
-                if gauges:
-                    selected_idx = min(selected_idx, len(gauges) - 1)
+                refresh_gauges()
                 save_state(state_path, state)
             elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
                 next_poll_at = datetime.now(timezone.utc)
@@ -3047,11 +2118,14 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
     try:
         with state_lock(state_path):
             state = load_state(state_path)
+            meta = state.setdefault("meta", {})
+            if isinstance(meta, dict):
+                meta["api_backend"] = getattr(args, "usgs_backend", "blended")
             apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
             maybe_refresh_community(state, args)
             seed_user_location_from_args(state, args)
-            gauges = ordered_gauges()
+            gauges, divider_index = compute_table_gauges(state)
             save_state(state_path, state)
             readings: Dict[str, Dict[str, Any]] = {}
             selected_idx = 0
@@ -3065,6 +2139,23 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
             ui_tick = getattr(args, "ui_tick_sec", UI_TICK_SEC)
             if not isinstance(ui_tick, (int, float)) or ui_tick <= 0:
                 ui_tick = UI_TICK_SEC
+
+            def refresh_gauges() -> None:
+                nonlocal gauges, divider_index, selected_idx
+                selected_id = None
+                if gauges and 0 <= selected_idx < len(gauges):
+                    selected_id = gauges[selected_idx]
+                new_gauges, new_divider = compute_table_gauges(state)
+                if new_gauges == gauges and new_divider == divider_index:
+                    return
+                gauges = new_gauges
+                divider_index = new_divider
+                if selected_id is not None and selected_id in gauges:
+                    selected_idx = gauges.index(selected_id)
+                elif gauges:
+                    selected_idx = min(selected_idx, len(gauges) - 1)
+                else:
+                    selected_idx = 0
 
             while True:
                 now = datetime.now(timezone.utc)
@@ -3116,11 +2207,13 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                             float(loc[1]),
                             n=3,
                         )
+                        refresh_gauges()
 
                 draw_screen(
                     stdscr,
                     curses,
                     gauges,
+                    divider_index,
                     readings,
                     state,
                     selected_idx,
@@ -3144,17 +2237,21 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                     toggle_row = footer_y - 1
                     if clicked_row == toggle_row:
                         status_msg = toggle_nearby(state, args)
-                        gauges = ordered_gauges()
-                        if gauges:
-                            selected_idx = min(selected_idx, len(gauges) - 1)
+                        refresh_gauges()
                         save_state(state_path, state)
                         await asyncio.sleep(0)
                         continue
                     first_gauge_row = TUI_TABLE_START + 1
-                    target = clicked_row - first_gauge_row
-                    if 0 <= target < len(gauges):
+                    rel = clicked_row - first_gauge_row
+                    has_divider = isinstance(divider_index, int) and 0 < divider_index < len(gauges)
+                    if has_divider and rel == divider_index:
+                        await asyncio.sleep(0)
+                        continue  # divider line
+                    if has_divider and rel > divider_index:
+                        rel -= 1
+                    if 0 <= rel < len(gauges):
                         selected_idx, detail_mode, status_msg = handle_row_click(
-                            target, selected_idx, detail_mode, gauges
+                            rel, selected_idx, detail_mode, gauges
                         )
                     await asyncio.sleep(0)
                     continue
@@ -3173,9 +2270,7 @@ async def web_tui_main(argv: list[str] | None = None) -> int:
                     status_msg = f"Alerts: {'on' if update_alert else 'off'}"
                 elif key in (ord("n"), ord("N")):
                     status_msg = toggle_nearby(state, args)
-                    gauges = ordered_gauges()
-                    if gauges:
-                        selected_idx = min(selected_idx, len(gauges) - 1)
+                    refresh_gauges()
                     save_state(state_path, state)
                 elif key in (ord("r"), ord("R"), ord("f"), ord("F")):
                     next_poll_at = datetime.now(timezone.utc)
@@ -3195,6 +2290,9 @@ def adaptive_loop(args: argparse.Namespace) -> int:
     try:
         with state_lock(state_path):
             state = load_state(state_path)
+            meta = state.setdefault("meta", {})
+            if isinstance(meta, dict):
+                meta["api_backend"] = getattr(args, "usgs_backend", "blended")
             apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
             maybe_refresh_community(state, args)
@@ -3392,6 +2490,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with state_lock(state_path):
             state = load_state(state_path)
+            meta = state.setdefault("meta", {})
+            if isinstance(meta, dict):
+                meta["api_backend"] = getattr(args, "usgs_backend", "blended")
             apply_dynamic_sites_from_state(state)
             maybe_backfill_state(state, args.backfill_hours)
             maybe_refresh_community(state, args)

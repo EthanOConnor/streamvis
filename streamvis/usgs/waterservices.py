@@ -8,7 +8,6 @@ from USGS NWIS.
 from __future__ import annotations
 
 import time
-from datetime import datetime
 from typing import Any
 
 from http_client import get_json, get_text
@@ -20,10 +19,139 @@ from streamvis.constants import (
 from streamvis.utils import parse_timestamp, iso8601_duration
 
 
+def parse_latest_payload(
+    payload: dict[str, Any] | None,
+    site_map: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """
+    Parse a WaterServices IV JSON payload into normalized gauge readings.
+
+    Returns:
+        {gauge_id: {"stage": float|None, "flow": float|None, "observed_at": datetime|None}}
+    """
+    if not site_map:
+        return {}
+
+    result: dict[str, dict[str, Any]] = {
+        g: {"stage": None, "flow": None, "observed_at": None} for g in site_map.keys()
+    }
+
+    if not isinstance(payload, dict):
+        return result
+
+    site_to_gauge = {v: k for k, v in site_map.items()}
+
+    ts_list = payload.get("value", {}).get("timeSeries", [])
+    if not isinstance(ts_list, list):
+        return result
+
+    for ts in ts_list:
+        try:
+            if not isinstance(ts, dict):
+                continue
+            site_no = ts["sourceInfo"]["siteCode"][0]["value"]
+            param = ts["variable"]["variableCode"][0]["value"]
+            gauge_id = site_to_gauge.get(site_no)
+            if gauge_id is None:
+                continue
+
+            values = ts.get("values", [])
+            if not values or not values[0].get("value"):
+                continue
+
+            last_point = values[0]["value"][-1]
+            val = float(last_point["value"])
+            ts_raw = last_point.get("dateTime")
+            obs_at = parse_timestamp(ts_raw)
+        except Exception:
+            continue
+
+        if param == "00060":  # discharge, cfs
+            result[gauge_id]["flow"] = val
+        elif param == "00065":  # gage height, ft
+            result[gauge_id]["stage"] = val
+
+        current_obs = result[gauge_id].get("observed_at")
+        if obs_at and (current_obs is None or obs_at > current_obs):
+            result[gauge_id]["observed_at"] = obs_at
+
+    return result
+
+
+def parse_history_payload(
+    payload: dict[str, Any] | None,
+    site_map: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    Parse a WaterServices IV JSON payload into per-gauge history points.
+
+    Returns:
+        {gauge_id: [{"ts": str, "stage": float|None, "flow": float|None}, ...]}
+    """
+    if not site_map:
+        return {}
+
+    result: dict[str, list[dict[str, Any]]] = {g: [] for g in site_map.keys()}
+    if not isinstance(payload, dict):
+        return result
+
+    site_to_gauge = {v: k for k, v in site_map.items()}
+    points: dict[tuple[str, str], dict[str, Any]] = {}
+
+    ts_list = payload.get("value", {}).get("timeSeries", [])
+    if not isinstance(ts_list, list):
+        return result
+
+    for ts in ts_list:
+        try:
+            if not isinstance(ts, dict):
+                continue
+            site_no = ts["sourceInfo"]["siteCode"][0]["value"]
+            param = ts["variable"]["variableCode"][0]["value"]
+            gauge_id = site_to_gauge.get(site_no)
+            if gauge_id is None:
+                continue
+
+            values = ts.get("values", [])
+            if not values:
+                continue
+            series_values = values[0].get("value", [])
+            if not isinstance(series_values, list):
+                continue
+        except Exception:
+            continue
+
+        for v in series_values:
+            try:
+                if not isinstance(v, dict):
+                    continue
+                ts_raw = v.get("dateTime", "")
+                if not isinstance(ts_raw, str) or not ts_raw:
+                    continue
+                val = float(v.get("value", 0))
+            except Exception:
+                continue
+
+            key = (gauge_id, ts_raw)
+            if key not in points:
+                points[key] = {"ts": ts_raw, "stage": None, "flow": None}
+            if param == "00060":
+                points[key]["flow"] = val
+            elif param == "00065":
+                points[key]["stage"] = val
+
+    for (gauge_id, _), point in points.items():
+        result[gauge_id].append(point)
+    for gauge_id in result:
+        result[gauge_id].sort(key=lambda p: p.get("ts", ""))
+    return result
+
+
 def fetch_latest(
     site_map: dict[str, str],
     modified_since_sec: float | None = None,
     timeout: float = 5.0,
+    base_url: str = DEFAULT_USGS_IV_URL,
 ) -> tuple[dict[str, dict[str, Any]], float]:
     """
     Fetch latest IV readings from USGS WaterServices.
@@ -39,13 +167,7 @@ def fetch_latest(
     """
     if not site_map:
         return {}, 0.0
-    
-    # Prepare result skeleton
-    result: dict[str, dict[str, Any]] = {
-        g: {"stage": None, "flow": None, "observed_at": None}
-        for g in site_map.keys()
-    }
-    
+
     params: dict[str, str] = {
         "format": "json",
         "sites": ",".join(site_map.values()),
@@ -57,51 +179,20 @@ def fetch_latest(
     
     start_ms = time.monotonic() * 1000
     try:
-        payload = get_json(DEFAULT_USGS_IV_URL, params=params, timeout=timeout)
+        payload = get_json(base_url, params=params, timeout=timeout)
     except Exception:
         return {}, time.monotonic() * 1000 - start_ms
     latency_ms = time.monotonic() * 1000 - start_ms
-    
-    # Reverse map: USGS site -> gauge ID
-    site_to_gauge = {v: k for k, v in site_map.items()}
-    
-    ts_list = payload.get("value", {}).get("timeSeries", [])
-    for ts in ts_list:
-        try:
-            site_no = ts["sourceInfo"]["siteCode"][0]["value"]
-            param = ts["variable"]["variableCode"][0]["value"]
-            gauge_id = site_to_gauge.get(site_no)
-            if gauge_id is None:
-                continue
-            
-            values = ts.get("values", [])
-            if not values or not values[0].get("value"):
-                continue
-            
-            last_point = values[0]["value"][-1]
-            val = float(last_point["value"])
-            ts_raw = last_point.get("dateTime")
-            obs_at = parse_timestamp(ts_raw)
-        except Exception:
-            continue
-        
-        if param == "00060":  # discharge, cfs
-            result[gauge_id]["flow"] = val
-        elif param == "00065":  # gage height, ft
-            result[gauge_id]["stage"] = val
-        
-        # Track freshest observation time
-        current_obs = result[gauge_id].get("observed_at")
-        if obs_at and (current_obs is None or obs_at > current_obs):
-            result[gauge_id]["observed_at"] = obs_at
-    
-    return result, latency_ms
+
+    readings = parse_latest_payload(payload, site_map)
+    return readings, latency_ms
 
 
 def fetch_history(
     site_map: dict[str, str],
     period_hours: int = 6,
     timeout: float = 10.0,
+    base_url: str = DEFAULT_USGS_IV_URL,
 ) -> tuple[dict[str, list[dict[str, Any]]], float]:
     """
     Fetch historical IV readings for backfill.
@@ -112,9 +203,7 @@ def fetch_history(
     """
     if not site_map:
         return {}, 0.0
-    
-    result: dict[str, list[dict[str, Any]]] = {g: [] for g in site_map.keys()}
-    
+
     params = {
         "format": "json",
         "sites": ",".join(site_map.values()),
@@ -125,52 +214,13 @@ def fetch_history(
     
     start_ms = time.monotonic() * 1000
     try:
-        payload = get_json(DEFAULT_USGS_IV_URL, params=params, timeout=timeout)
+        payload = get_json(base_url, params=params, timeout=timeout)
     except Exception:
-        return result, time.monotonic() * 1000 - start_ms
+        return {g: [] for g in site_map.keys()}, time.monotonic() * 1000 - start_ms
     latency_ms = time.monotonic() * 1000 - start_ms
-    
-    site_to_gauge = {v: k for k, v in site_map.items()}
-    
-    # Collect all values by (gauge_id, timestamp)
-    points: dict[tuple[str, str], dict[str, Any]] = {}
-    
-    ts_list = payload.get("value", {}).get("timeSeries", [])
-    for ts in ts_list:
-        try:
-            site_no = ts["sourceInfo"]["siteCode"][0]["value"]
-            param = ts["variable"]["variableCode"][0]["value"]
-            gauge_id = site_to_gauge.get(site_no)
-            if gauge_id is None:
-                continue
-            
-            values = ts.get("values", [])
-            if not values:
-                continue
-            
-            for v in values[0].get("value", []):
-                ts_raw = v.get("dateTime", "")
-                val = float(v.get("value", 0))
-                
-                key = (gauge_id, ts_raw)
-                if key not in points:
-                    points[key] = {"ts": ts_raw, "stage": None, "flow": None}
-                
-                if param == "00060":
-                    points[key]["flow"] = val
-                elif param == "00065":
-                    points[key]["stage"] = val
-        except Exception:
-            continue
-    
-    # Group by gauge and sort by timestamp
-    for (gauge_id, _), point in points.items():
-        result[gauge_id].append(point)
-    
-    for gauge_id in result:
-        result[gauge_id].sort(key=lambda p: p.get("ts", ""))
-    
-    return result, latency_ms
+
+    history = parse_history_payload(payload, site_map)
+    return history, latency_ms
 
 
 def fetch_sites_near(
@@ -178,6 +228,7 @@ def fetch_sites_near(
     lon: float,
     radius_miles: float,
     timeout: float = 10.0,
+    site_url: str = DEFAULT_USGS_SITE_URL,
 ) -> tuple[list[dict[str, Any]], float]:
     """
     Fetch active USGS stream gauges near a location.
@@ -200,15 +251,15 @@ def fetch_sites_near(
     
     start_ms = time.monotonic() * 1000
     try:
-        text = get_text(DEFAULT_USGS_SITE_URL, params=params, timeout=timeout)
+        text = get_text(site_url, params=params, timeout=timeout)
     except Exception:
         return [], time.monotonic() * 1000 - start_ms
     latency_ms = time.monotonic() * 1000 - start_ms
     
-    return _parse_rdb(text), latency_ms
+    return parse_site_rdb(text), latency_ms
 
 
-def _parse_rdb(text: str) -> list[dict[str, Any]]:
+def parse_site_rdb(text: str) -> list[dict[str, Any]]:
     """Parse USGS RDB format into site dicts."""
     if not text:
         return []

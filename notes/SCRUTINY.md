@@ -366,3 +366,13 @@ Design vs implementation:
 - **Low – Web publish queue behavior under offline/slow networks**: web publishing is queued and drained asynchronously to keep iOS responsive, but if the network is down the queue could drop samples. Mitigation: queue is capped (drops oldest) and publishing is “best effort” by design; add optional debug timestamps if we need operator visibility.
 
 - **Low – Persisted publish opt-in**: the browser caches `publish=1` in localStorage for convenience. Risk: a user could forget it’s enabled. Mitigation: publishing remains opt-in; consider a small UI indicator later if this matters.
+
+## 2025-12-18 – Infra Finalization Sprint follow-ups
+
+- **Guardrail – USGS payload shape drift**: added pure parsing helpers + unit tests for both WaterServices and OGC responses so future refactors can’t silently break the adapter’s expectations.
+- **Guardrail – web bundle sync**: added a test that asserts `web/main.js`’s `streamvisFiles` list matches `streamvis/**/*.py` so Pyodide packaging doesn’t rot as modules are added/moved.
+- **Mitigation – TypedDict runtime fragility**: avoid copying TypedDicts via `TypedDict(**meta)`/`(**stats)` (requires identifier-like keys); use `dict(...)` copies instead.
+- **Mitigation – fixed-width dynamic gauge IDs**: keep dynamically discovered gauges at 6 chars (e.g., `U12345`) with a 6-char collision strategy, preventing table column overflow.
+- **Low – divider row click mapping**: grouping Nearby gauges under a divider adds a non-gauge row in the table; we must map taps/clicks to gauge indices correctly in web/native. Mitigation: explicit mapping logic plus unit tests in `tests/test_nearby.py`.
+- **Medium – GitHub Pages Jekyll excludes `__init__.py`**: default Pages builds may omit underscore-prefixed files, breaking Pyodide module loads for Python packages. Mitigation: publish `.nojekyll` at the site root; additionally, the web entrypoint/loader avoid relying on `__init__.py` by importing modules directly and treating `__init__.py` as optional.
+- **Residual risk – dual sources of truth temptation**: `streamvis/tui.py` still contains TUI glue and wrappers; the canonical behavior should remain in `streamvis/state.py`, `streamvis/scheduler.py`, and `streamvis/usgs/*` to avoid semantic drift.

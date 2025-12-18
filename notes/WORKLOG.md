@@ -284,3 +284,33 @@ All 12 tests pass. Web deployment now loads from package.
 - Improved native TUI degradation: when live fetch fails, the table/detail view now fall back to persisted `last_stage`/`last_flow`, and the footer shows the underlying fetch error (e.g., missing `requests`) while backing off.
 - Fixed packaging so `pip install .` installs the `streamvis/` package (and `streamvis.usgs`) instead of the legacy `streamvis.py` module; also aligned `pyproject.toml` version to `0.3.0`.
 - Verification: `node --check web/main.js`, `python -m unittest discover -s tests` (all 12 pass), `python -m streamvis --help`.
+
+## 2025-12-18 – Infra Finalization Sprint (Core Stabilization)
+
+- Made the extracted modules (`streamvis/state.py`, `streamvis/scheduler.py`, `streamvis/usgs/*`) the single source of truth by porting the mature cadence/latency logic that was still duplicated in `streamvis/tui.py`.
+- Wired `--usgs-backend` end-to-end: all modes now persist `meta.api_backend`, and live fetches route through the dual-backend adapter with per-backend latency stats.
+- Threaded the configured WaterServices base URL (`config.toml` `[global.usgs].iv_base_url`) through the USGS adapter so “observed data source” is controlled in one place.
+- Added offline parsing helpers and unit tests for USGS WaterServices + OGC payloads and adapter behavior (`tests/test_usgs_parsing.py`, `tests/test_usgs_adapter.py`).
+- Added a guardrail test to keep `web/main.js`’s `streamvisFiles` list in sync with `streamvis/**/*.py` (`tests/test_web_bundle.py`).
+- Removed shadowed “gauge helper” implementations from `streamvis/tui.py` and standardized on `streamvis/gauges.py` + `streamvis/utils.py` (avoids subtle drift in Nearby/dynamic-station behavior).
+- Hardened TypedDict copying in `streamvis/usgs/adapter.py` and documented `meta.last_backend_used` in `streamvis/types.py`.
+- Updated CI to include Python 3.10 and to `pip install .` before running tests.
+- Verification: `python -m unittest discover -s tests` (19 tests).
+
+## 2025-12-18 – Nearby Gauge Lifecycle + Table Divider
+
+- When Nearby is enabled, group the “nearby” gauges at the bottom of the main table under a divider (no duplicate rows).
+- When Nearby is toggled off, evict dynamically added Nearby gauges so they stop being tracked/polled and don’t bloat state/browser storage.
+- Added `streamvis/state.py` `evict_dynamic_sites()` plus unit coverage for ordering/eviction (`tests/test_nearby.py`).
+- Updated README Nearby-mode description to match the new UX/eviction semantics.
+- Verification: `python -m unittest discover -s tests` (23 tests).
+
+## 2025-12-18 – Web Hosting Fix: `.nojekyll` + Better Loader Hints
+
+- Added `.nojekyll` (repo root + `web/`) so GitHub Pages publishes Python package files like `streamvis/__init__.py`.
+- Updated browser loader error messaging (`web/main.js`) to hint about missing Python sources / `file://` usage.
+- Updated README GitHub Pages instructions to include publishing the `streamvis/` package directory.
+- Made the browser build resilient to hosts that do not publish `__init__.py` / `__main__.py`:
+  - `web_entrypoint.py` imports `streamvis.tui` directly (no reliance on `streamvis/__init__.py`).
+  - `streamvis/tui.py` and `streamvis/state.py` import USGS adapter directly (no reliance on `streamvis/usgs/__init__.py`).
+  - `web/main.js` treats `__init__.py`/`__main__.py` as optional during module fetch/install.

@@ -11,7 +11,7 @@ argument list suitable for running the TUI in a web "terminal".
 
 from typing import List
 
-from streamvis import main, web_tui_main
+from streamvis.tui import main, web_tui_main
 
 
 def _append_community_args(argv: List[str]) -> None:

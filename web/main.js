@@ -337,7 +337,13 @@ async function main() {
     "../streamvis/__main__.py",
   ];
   for (const file of streamvisFiles) {
-    await loadPythonModule(pyodide, file, { importModule: false });
+    const optional = file.endsWith("/__init__.py") || file.endsWith("/__main__.py");
+    try {
+      await loadPythonModule(pyodide, file, { importModule: false });
+    } catch (err) {
+      if (!optional) throw err;
+      console.warn("Optional python file missing:", file, err);
+    }
   }
 
   await loadPythonModule(pyodide, "../web_entrypoint.py");
@@ -369,6 +375,32 @@ await run_default_async()
 
 main().catch((err) => {
   console.error(err);
-  term.textContent = "Error initialising streamvis:\\n" + err;
+  let msg = "Error initialising streamvis:\\n" + err;
+
+  try {
+    const errStr = String(err || "");
+    const isFile = window.location && window.location.protocol === "file:";
+    const looksLikeMissingPySource =
+      errStr.includes("Failed to load") && (errStr.includes("streamvis/") || errStr.includes("streamvis\\"));
+    const mentionsInit = errStr.includes("__init__.py");
+
+    if (isFile) {
+      msg +=
+        "\\n\\nTip: open this page via a local web server (http://), not file://.\\n" +
+        "For example, run `python -m http.server` from the repo root and open /web/.";
+    } else if (looksLikeMissingPySource) {
+      msg +=
+        "\\n\\nTip: the browser couldn't fetch the streamvis Python sources.\\n" +
+        "- Ensure the published site includes the `streamvis/` package directory and the helper modules.\\n" +
+        "- If using GitHub Pages, you likely need a `.nojekyll` file so `__init__.py` is published.";
+      if (mentionsInit) {
+        msg += "\\n  (This error often means `streamvis/__init__.py` was not published.)";
+      }
+    }
+  } catch (_hintErr) {
+    // Ignore hint failures.
+  }
+
+  term.textContent = msg;
   setLoading("Error initializing Pyodide (see console).", 100);
 });

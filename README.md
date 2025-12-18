@@ -75,7 +75,7 @@ Options:
 - `--community-base URL`: optional base URL for shared “community” priors. If set, `streamvis` fetches `{URL}/summary.json` at most once per day to seed cold starts with observed cadence/latency for each station.
 - `--community-publish`: when used with `--community-base`, publish per‑update latency samples to `{URL}/sample` (native + browser when enabled).
 - `--user-lat` / `--user-lon`: optional manual location for the Nearby gauges section in native TUI mode.
-- Nearby mode (`n` in TUI): when enabled and a location is available, `streamvis` queries the USGS Site Service for active IV stream gauges near you, adds the three closest to the session/state if they aren’t already tracked, and shows them in a small “Closest stations” panel.
+- Nearby mode (`n` in TUI): when enabled and a location is available, `streamvis` queries the USGS Site Service for active IV stream gauges near you, adds the three closest to the session if they aren’t already tracked, and groups the “nearby” gauges at the bottom of the main table under a divider. When you toggle Nearby off, any gauges that were newly added by Nearby are evicted (no longer tracked/polled).
 - `--ui-tick-sec` (default 0.15): UI refresh tick in TUI mode; raise this on slow devices/browsers to reduce CPU.
 - `--no-update-alert`: in TUI mode, disable the bell/flash alert when new data is fetched.
 
@@ -172,7 +172,7 @@ Note: TUI mode uses Python `curses` (available on macOS/Linux; Windows users may
 
 `streamvis` also ships a small browser harness that runs the existing curses TUI inside a web page using Pyodide (Python → WebAssembly) and a minimal `web_curses` shim:
 
-- The core logic in `streamvis.py` is unchanged; only HTTP and curses are abstracted behind `http_client.py` and `web_curses.py`.
+- The core logic lives in the `streamvis/` package; only HTTP and curses are abstracted behind `http_client.py` and `web_curses.py`.
 - In the browser, HTTP calls use `pyodide.http.open_url`, so requests go directly from the page to USGS/NWPS/NWRFC with CORS.
 - The TUI draws into a `<div id="terminal">` using `web_curses`, and key events (`q`, arrows, `c`, `r`, `f`, `Enter`) are forwarded from JS into `getch()`.
 - State is persisted between browser sessions by mapping the `--state-file streamvis_state.json` used by the web entrypoint to `localStorage` (`streamvis_state_json`) and syncing it on every save, so even a mid‑run reload retains learned cadence/latency. If the full state ever exceeds browser storage quotas, streamvis falls back to persisting a slimmer state that preserves scheduling/latency learning but drops bulky overlays.
@@ -186,9 +186,12 @@ Community config in the browser (optional):
 
 To host this on GitHub Pages:
 
-1. Publish `web/index.html` and `web/main.js` alongside the Python modules (`streamvis.py`, `http_client.py`, `web_curses.py`, `web_entrypoint.py`, `config.toml`).
-   - If GitHub Pages serves the repo root, keep the Python files at root and open `/web/`.
-   - If GitHub Pages serves `web/` as the Pages root, copy the Python files into `web/` as well. The loader will try both `./module.py` and `../module.py`.
+1. Ensure a `.nojekyll` file exists at the site root so GitHub Pages publishes Python package files like `__init__.py`.
+2. Publish `web/index.html` and `web/main.js` alongside the Python sources:
+   - `http_client.py`, `web_curses.py`, `web_entrypoint.py`, `config.toml`
+   - the full `streamvis/` package directory (including `streamvis/__init__.py`)
+   - If GitHub Pages serves the repo root, keep the Python sources at repo root and open `/web/`.
+   - If GitHub Pages serves `web/` as the Pages root, copy the Python sources into `web/` as well. The loader will try both `./...` and `../...`.
 2. Configure GitHub Pages to serve either the repo root or the `web/` directory, matching the layout above.
 3. Open the Pages URL on your phone or desktop; the page will load Pyodide from a CDN and start `streamvis` in TUI mode inside the browser.
 

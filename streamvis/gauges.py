@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from streamvis.config import FLOOD_THRESHOLDS, STATION_LOCATIONS, SITE_MAP
+from streamvis.config import CONFIG, FLOOD_THRESHOLDS, STATION_LOCATIONS, SITE_MAP
+from streamvis.constants import DYNAMIC_GAUGE_PREFIX
 from streamvis.utils import haversine_miles
 
 
@@ -58,11 +59,15 @@ def nearest_gauges(
 
 
 def station_display_name(gauge_id: str, state: dict[str, Any] | None = None) -> str:
-    """
-    Return a human-readable display name for a gauge.
-    
-    Checks dynamic sites in state first, then falls back to gauge_id.
-    """
+    """Return a human-friendly display name for a gauge_id."""
+    stations_cfg = CONFIG.get("stations")
+    if isinstance(stations_cfg, dict):
+        entry = stations_cfg.get(gauge_id)
+        if isinstance(entry, dict):
+            display_name = entry.get("display_name")
+            if isinstance(display_name, str) and display_name:
+                return display_name
+
     if state is not None:
         meta = state.get("meta", {})
         if isinstance(meta, dict):
@@ -73,8 +78,7 @@ def station_display_name(gauge_id: str, state: dict[str, Any] | None = None) -> 
                     name = site.get("station_nm") or site.get("name")
                     if isinstance(name, str) and name:
                         return name
-    
-    # Fallback: use gauge_id as display name
+
     return gauge_id
 
 
@@ -126,19 +130,23 @@ def dynamic_gauge_id(site_no: str, existing_ids: list[str]) -> str:
     """
     Derive a short, stable gauge_id for a USGS site_no, avoiding collisions.
     """
-    from streamvis.constants import DYNAMIC_GAUGE_PREFIX
-    
-    # Try to create a unique ID from the site number
-    base_id = f"{DYNAMIC_GAUGE_PREFIX}{site_no[-5:]}" if len(site_no) >= 5 else f"{DYNAMIC_GAUGE_PREFIX}{site_no}"
-    
-    if base_id not in existing_ids:
-        return base_id
-    
-    # Handle collision by appending a suffix
-    for suffix in range(2, 100):
-        candidate = f"{base_id}{suffix}"
-        if candidate not in existing_ids:
-            return candidate
-    
-    # Fallback: use full site number
-    return f"{DYNAMIC_GAUGE_PREFIX}{site_no}"
+    suffix = site_no[-5:] if len(site_no) >= 5 else site_no
+    base = f"{DYNAMIC_GAUGE_PREFIX}{suffix}"[:6]
+    if base not in existing_ids:
+        return base
+
+    last4 = suffix[-4:] if len(suffix) >= 4 else suffix.rjust(4, "0")
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for ch in alphabet:
+        cand = f"{DYNAMIC_GAUGE_PREFIX}{last4}{ch}"
+        if cand not in existing_ids:
+            return cand
+
+    last3 = suffix[-3:] if len(suffix) >= 3 else suffix.rjust(3, "0")
+    for a in alphabet:
+        for b in alphabet:
+            cand = f"{DYNAMIC_GAUGE_PREFIX}{last3}{a}{b}"
+            if cand not in existing_ids:
+                return cand
+
+    return base

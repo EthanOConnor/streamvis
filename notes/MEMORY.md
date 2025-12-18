@@ -230,3 +230,43 @@
   - `loadPythonModule()` derives a filesystem path from the fetched URL, creates directories, derives a dotted module name, and optionally skips the import.
   - Browser startup writes the full fixed list of `streamvis/*.py` files with `importModule: false`, then imports `web_entrypoint` (which imports `streamvis`) once everything exists.
 - **Trade-offs**: The JS `streamvisFiles` list must be kept in sync when adding new package modules, but this is preferable to re-monolithizing `tui.py` just for the web build.
+
+## 2025-12-18 – Infra Finalization: Canonical Core Modules
+
+- **Decision**: Treat `streamvis/state.py`, `streamvis/scheduler.py`, and `streamvis/usgs/*` as the single source of truth for non-UI behavior; `streamvis/tui.py` may wrap for convenience but should not contain independent algorithm implementations.
+- **WaterServices modifiedSince shape**:
+  - Added `compute_modified_since_sec(state) -> float | None` for internal use (adapter) and kept `compute_modified_since(state) -> str | None` as the WaterServices-facing ISO-8601 duration.
+  - Rationale: avoids conflating transport formatting with scheduling logic and keeps adapter plumbing straightforward.
+- **USGS backend metadata semantics**:
+  - `meta.api_backend` represents the user-configured mode (`blended|waterservices|ogc`).
+  - `meta.preferred_backend` is the learned best backend when in blended mode.
+  - `meta.last_backend_used` records what a given fetch actually used (prevents “blended” config from collapsing into a permanent single-backend mode via persisted state).
+- **Dynamic gauge IDs**:
+  - Keep dynamically discovered gauge IDs fixed-width (6 chars, e.g. `U12345`) so they fit the main table without layout drift.
+  - Collision resolution uses `U` + last-4 digits + a base36 character suffix (still 6 chars).
+- **Browser persistence**:
+- `save_state()` in `streamvis/state.py` is responsible for write-through persistence to browser `localStorage` under Pyodide, matching native “state survives crashes/reloads” expectations.
+
+## 2025-12-18 – Nearby lifecycle: active-only + table grouping
+
+- **Decision**: Treat Nearby-discovered dynamic gauges as *ephemeral* and only active while `meta.nearby_enabled` is true.
+  - `apply_dynamic_sites_from_state(state)` now activates `meta.dynamic_sites` into `SITE_MAP`/`STATION_LOCATIONS` only when Nearby is enabled.
+  - When Nearby is toggled off, we evict any dynamically added gauges (remove them from state + active tracking) and clear the Nearby search cache so re-enabling performs a fresh discovery.
+- **UX**: Nearby gauges are grouped at the bottom of the main table under a divider instead of occupying a separate “closest stations” panel.
+  - Gauges that are already tracked can still appear in the Nearby group (reordered), but are not duplicated.
+- **Rationale**: keeps the tracked/polled set tight by default, prevents long-lived dynamic-gauge bloat (especially in browser `localStorage`), and makes “Nearby” feel like an explicit mode rather than a permanent expansion of the station set.
+
+## 2025-12-18 – GitHub Pages: disable Jekyll for Python packages
+
+- **Issue**: GitHub Pages’ default Jekyll build can omit files that start with `_`, which breaks Pyodide loading of package entrypoints like `streamvis/__init__.py` and `streamvis/__main__.py`.
+- **Decision**: include a `.nojekyll` file in the published site root (and we keep one at both repo root + `web/` for either Pages layout).
+- **Rationale**: makes the browser build reliable without renaming standard Python package files.
+
+## 2025-12-18 – Web build: avoid relying on `__init__.py`
+
+- **Problem**: Some static hosts (notably GitHub Pages with Jekyll enabled) may not publish `__init__.py` / `__main__.py`, breaking package-style imports in Pyodide.
+- **Decision**: Make the web build tolerant of missing underscore files:
+  - `web_entrypoint.py` imports `streamvis.tui` directly rather than `from streamvis import ...`.
+  - Internal imports avoid `from streamvis.usgs import ...` re-exports (use `streamvis.usgs.adapter` directly).
+  - `web/main.js` treats `__init__.py` and `__main__.py` as optional when fetching/installing Python files.
+- **Result**: The browser build can run either as a normal package (when `__init__.py` is present) or as a namespace package (when it’s not), without requiring site-level configuration changes.

@@ -148,6 +148,7 @@ class MetaState(TypedDict, total=False):
     waterservices: BackendStats
     ogc: BackendStats
     preferred_backend: str | None  # Set when statistical confidence reached
+    last_backend_used: str         # Effective backend used for last fetch
     last_backend_probe_ts: str     # For periodic re-evaluation
     
     # Community priors

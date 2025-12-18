@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 from streamvis.constants import (
     BACKEND_LATENCY_EWMA_ALPHA,
@@ -34,6 +34,8 @@ from streamvis.constants import (
 from streamvis.types import BackendStats, MetaState
 from streamvis.utils import ewma, ewma_variance, parse_timestamp
 from streamvis.usgs import waterservices, ogcapi
+
+from streamvis.config import USGS_IV_URL
 
 
 class USGSBackend(Enum):
@@ -65,7 +67,7 @@ def _update_backend_stats(
     """Update backend statistics with new request result."""
     now_ts = datetime.now(timezone.utc).isoformat()
     
-    new_stats = BackendStats(**stats)  # Copy
+    new_stats = cast(BackendStats, dict(stats))  # Copy
     
     if success:
         new_stats["success_count"] = stats.get("success_count", 0) + 1
@@ -213,7 +215,8 @@ def fetch_gauge_data(
     if not site_map:
         return {}, meta
     
-    new_meta = MetaState(**meta)  # Copy
+    new_meta = cast(MetaState, dict(meta))  # Copy
+    requested_backend = backend
     
     # Initialize backend stats if missing
     if "waterservices" not in new_meta:
@@ -230,7 +233,12 @@ def fetch_gauge_data(
             backend = USGSBackend.BLENDED  # Probe both
         else:
             backend = preferred
-    
+
+    # Record the decision for observability/debugging.
+    new_meta["preferred_backend"] = preferred.value if preferred is not None else None
+    new_meta["api_backend"] = requested_backend.value
+    new_meta["last_backend_used"] = backend.value
+
     ws_readings: dict[str, dict[str, Any]] = {}
     ogc_readings: dict[str, dict[str, Any]] = {}
     
@@ -238,7 +246,7 @@ def fetch_gauge_data(
     if backend in (USGSBackend.BLENDED, USGSBackend.WATERSERVICES):
         try:
             ws_readings, ws_latency = waterservices.fetch_latest(
-                site_map, modified_since_sec
+                site_map, modified_since_sec, base_url=USGS_IV_URL
             )
             success = bool(ws_readings)
             new_meta["waterservices"] = _update_backend_stats(
@@ -290,7 +298,7 @@ def fetch_gauge_history(
         history, _ = ogcapi.fetch_history(site_map, start_time, end_time)
         return history
     else:
-        history, _ = waterservices.fetch_history(site_map, period_hours)
+        history, _ = waterservices.fetch_history(site_map, period_hours, base_url=USGS_IV_URL)
         return history
 
 

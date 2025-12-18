@@ -10,6 +10,7 @@ Implements the cadence learning and poll scheduling logic:
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, List
 
@@ -19,6 +20,9 @@ from streamvis.constants import (
     CADENCE_FIT_THRESHOLD,
     CADENCE_CLEAR_THRESHOLD,
     DEFAULT_INTERVAL_SEC,
+    MIN_UPDATE_GAP_SEC,
+    MAX_LEARNABLE_INTERVAL_SEC,
+    HISTORY_LIMIT,
     MIN_RETRY_SEC,
     HEADSTART_SEC,
     FINE_LATENCY_MAD_MAX_SEC,
@@ -29,7 +33,7 @@ from streamvis.constants import (
     LATENCY_PRIOR_LOC_SEC,
     LATENCY_PRIOR_SCALE_SEC,
 )
-from streamvis.utils import parse_timestamp, median
+from streamvis.utils import parse_timestamp, median, tukey_biweight_location_scale
 
 
 def snap_delta_to_cadence(delta_sec: float) -> tuple[float | None, int | None]:
@@ -78,7 +82,9 @@ def estimate_cadence_multiple(deltas_sec: List[float]) -> tuple[int | None, floa
         if fit > best_fit + 1e-9 or (abs(fit - best_fit) <= 1e-9 and cand > best_k):
             best_fit = fit
             best_k = cand
-    return best_k, best_fit
+    if best_fit >= CADENCE_FIT_THRESHOLD:
+        return best_k, best_fit
+    return None, best_fit
 
 
 def maybe_update_cadence_from_deltas(g_state: dict[str, Any]) -> None:
@@ -88,29 +94,39 @@ def maybe_update_cadence_from_deltas(g_state: dict[str, Any]) -> None:
     If confidence falls below CADENCE_CLEAR_THRESHOLD, clear the multiple so
     the EWMA can adapt to irregular behavior.
     """
-    history = g_state.get("history", [])
-    if not isinstance(history, list) or len(history) < 4:
+    deltas = g_state.get("deltas")
+    clean: List[float] = []
+    if isinstance(deltas, list) and deltas:
+        clean = [
+            float(d)
+            for d in deltas
+            if isinstance(d, (int, float)) and d >= MIN_UPDATE_GAP_SEC
+        ]
+    else:
+        history = g_state.get("history", [])
+        if not isinstance(history, list) or len(history) < 4:
+            return
+        prev_ts: datetime | None = None
+        for pt in history:
+            ts = parse_timestamp(pt.get("ts") if isinstance(pt, dict) else None)
+            if ts is not None and prev_ts is not None:
+                delta = (ts - prev_ts).total_seconds()
+                if delta >= MIN_UPDATE_GAP_SEC:
+                    clean.append(delta)
+            prev_ts = ts
+
+    if len(clean) < 3:
         return
 
-    deltas: List[float] = []
-    prev_ts: datetime | None = None
-    for pt in history:
-        ts = parse_timestamp(pt.get("ts"))
-        if ts is not None and prev_ts is not None:
-            delta = (ts - prev_ts).total_seconds()
-            if delta > 0:
-                deltas.append(delta)
-        prev_ts = ts
-
-    k, fit = estimate_cadence_multiple(deltas)
+    k, fit = estimate_cadence_multiple(clean[-HISTORY_LIMIT:])
     if k is not None and fit >= CADENCE_FIT_THRESHOLD:
         g_state["cadence_mult"] = k
         g_state["cadence_fit"] = fit
         g_state["mean_interval_sec"] = float(k * CADENCE_BASE_SEC)
-    elif fit < CADENCE_CLEAR_THRESHOLD and "cadence_mult" in g_state:
-        del g_state["cadence_mult"]
-        if "cadence_fit" in g_state:
-            del g_state["cadence_fit"]
+    else:
+        g_state["cadence_fit"] = float(fit)
+        if fit < CADENCE_CLEAR_THRESHOLD and "cadence_mult" in g_state:
+            g_state.pop("cadence_mult", None)
 
 
 def estimate_phase_offset_sec(g_state: dict[str, Any]) -> float | None:
@@ -121,38 +137,49 @@ def estimate_phase_offset_sec(g_state: dict[str, Any]) -> float | None:
     mean_interval_sec, and estimate the typical offset within that period.
     Returns phase in seconds within [0, cadence).
     """
-    k = g_state.get("cadence_mult")
-    if k is None or k < 1:
+    mean_interval = g_state.get("mean_interval_sec")
+    if not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
         return None
-    cadence = float(k * CADENCE_BASE_SEC)
+    cadence = float(mean_interval)
+
+    cad_mult = g_state.get("cadence_mult")
+    if not isinstance(cad_mult, int) or cad_mult <= 0:
+        return None
 
     history = g_state.get("history", [])
     if not isinstance(history, list) or len(history) < 3:
         return None
 
     offsets: List[float] = []
-    for pt in history:
+    seed: float | None = None
+    for pt in history[-HISTORY_LIMIT:]:
+        if not isinstance(pt, dict):
+            continue
         ts = parse_timestamp(pt.get("ts"))
         if ts is None:
             continue
-        epoch = ts.timestamp()
-        offset = epoch % cadence
-        offsets.append(offset)
+        off = ts.timestamp() % cadence
+        if seed is None:
+            seed = off
+        if seed is not None:
+            if off - seed > cadence / 2:
+                off -= cadence
+            elif seed - off > cadence / 2:
+                off += cadence
+        offsets.append(off)
 
-    if len(offsets) < 3:
+    if not offsets or seed is None:
         return None
 
-    # Circular median: unwrap offsets near 0/cadence boundary
-    unwrapped = []
-    for o in offsets:
-        if o > cadence * 0.75:
-            unwrapped.append(o - cadence)
-        else:
-            unwrapped.append(o)
-    med = median(unwrapped)
-    if med < 0:
-        med += cadence
-    return float(med)
+    loc, scale = tukey_biweight_location_scale(
+        offsets,
+        initial_loc=float(seed),
+        initial_scale=float(CADENCE_SNAP_TOL_SEC),
+    )
+    phase = float(loc % cadence)
+    g_state["phase_offset_sec"] = phase
+    g_state["phase_scale_sec"] = float(scale)
+    return phase
 
 
 def predict_gauge_next(
@@ -173,33 +200,36 @@ def predict_gauge_next(
     if last_ts is None:
         return None
 
-    interval = g_state.get("mean_interval_sec")
-    if not isinstance(interval, (int, float)) or interval <= 0:
-        interval = DEFAULT_INTERVAL_SEC
+    mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
+    if not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
+        mean_interval = DEFAULT_INTERVAL_SEC
+    mean_interval = max(MIN_UPDATE_GAP_SEC, min(float(mean_interval), MAX_LEARNABLE_INTERVAL_SEC))
+    cadence = float(mean_interval)
 
-    # Base prediction: last observation + interval
-    base_next = last_ts + timedelta(seconds=interval)
-
-    # Use phase offset if available
     phase = g_state.get("phase_offset_sec")
-    k = g_state.get("cadence_mult")
-    if phase is not None and k is not None and k >= 1:
-        cadence = float(k * CADENCE_BASE_SEC)
-        epoch = base_next.timestamp()
-        current_phase = epoch % cadence
-        shift = phase - current_phase
-        if shift < -cadence / 2:
-            shift += cadence
-        elif shift > cadence / 2:
-            shift -= cadence
-        base_next = base_next + timedelta(seconds=shift)
+    if not isinstance(phase, (int, float)) or phase < 0 or phase >= cadence:
+        phase = estimate_phase_offset_sec(g_state)
 
-    # Add latency estimate
+    if isinstance(phase, (int, float)):
+        base_t = max(last_ts.timestamp(), now.timestamp())
+        k = math.floor((base_t - float(phase)) / cadence) + 1
+        next_obs_t = k * cadence + float(phase)
+        next_obs = datetime.fromtimestamp(next_obs_t, tz=timezone.utc)
+    else:
+        delta_since_last = (now - last_ts).total_seconds()
+        if delta_since_last <= 0 or delta_since_last <= 2 * cadence:
+            next_obs = last_ts + timedelta(seconds=cadence)
+        else:
+            multiples = max(1, math.ceil(delta_since_last / cadence))
+            next_obs = last_ts + timedelta(seconds=cadence * multiples)
+
     latency_loc = g_state.get("latency_loc_sec")
-    if not isinstance(latency_loc, (int, float)) or latency_loc <= 0:
+    if not isinstance(latency_loc, (int, float)) or latency_loc < 0:
+        latency_loc = g_state.get("latency_median_sec", LATENCY_PRIOR_LOC_SEC)
+    if not isinstance(latency_loc, (int, float)) or latency_loc < 0:
         latency_loc = LATENCY_PRIOR_LOC_SEC
-    
-    return base_next + timedelta(seconds=latency_loc)
+
+    return next_obs + timedelta(seconds=float(latency_loc))
 
 
 def schedule_next_poll(
@@ -218,78 +248,82 @@ def schedule_next_poll(
     This function governs *normal* cadence; error backoff is handled separately.
     """
     gauges_state = state.get("gauges", {})
-    if not gauges_state:
-        return now + timedelta(seconds=min_retry_seconds)
+    if not isinstance(gauges_state, dict) or not gauges_state:
+        return now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
 
-    earliest_poll: datetime | None = None
-    min_coarse_step: float = float("inf")
+    best_time: datetime | None = None
 
     for gauge_id, g_state in gauges_state.items():
         if not isinstance(g_state, dict):
             continue
 
         last_ts = parse_timestamp(g_state.get("last_timestamp"))
-        if last_ts is None:
+        mean_interval = g_state.get("mean_interval_sec", DEFAULT_INTERVAL_SEC)
+        if last_ts is None or not isinstance(mean_interval, (int, float)) or mean_interval <= 0:
             continue
 
-        interval = g_state.get("mean_interval_sec")
-        if not isinstance(interval, (int, float)) or interval <= 0:
-            interval = DEFAULT_INTERVAL_SEC
-
-        # Coarse step scales with interval
-        coarse_step = max(min_retry_seconds, interval * COARSE_STEP_FRACTION)
-        min_coarse_step = min(min_coarse_step, coarse_step)
-
-        predicted = predict_gauge_next(state, gauge_id, now)
-        if predicted is None:
+        mean_interval = max(MIN_UPDATE_GAP_SEC, min(float(mean_interval), MAX_LEARNABLE_INTERVAL_SEC))
+        next_api = predict_gauge_next(state, gauge_id, now)
+        if next_api is None:
             continue
 
-        # Latency variance determines fine window eligibility
-        latency_mad = g_state.get("latency_mad_sec")
         latency_scale = g_state.get("latency_scale_sec")
-        if latency_scale is not None:
-            effective_mad = latency_scale
-        elif latency_mad is not None:
-            effective_mad = latency_mad
-        else:
-            effective_mad = LATENCY_PRIOR_SCALE_SEC
+        if not isinstance(latency_scale, (int, float)) or latency_scale < 0:
+            latency_scale = g_state.get("latency_mad_sec")
 
-        # Fine-window half-width
-        fine_half = max(FINE_WINDOW_MIN_SEC, effective_mad * 2)
-        window_start = predicted - timedelta(seconds=fine_half)
-        window_end = predicted + timedelta(seconds=fine_half)
+        fine_eligible = (
+            isinstance(latency_scale, (int, float))
+            and latency_scale > 0
+            and latency_scale <= FINE_LATENCY_MAD_MAX_SEC
+            and mean_interval <= 3600
+        )
 
-        if now < window_start:
-            # Coarse regime: schedule based on coarse step or headstart
-            next_coarse = min(
-                window_start - timedelta(seconds=HEADSTART_SEC),
-                now + timedelta(seconds=coarse_step),
-            )
-            if earliest_poll is None or next_coarse < earliest_poll:
-                earliest_poll = next_coarse
-        elif now <= window_end:
-            # Fine regime: poll soon if latency is stable
-            if effective_mad <= FINE_LATENCY_MAD_MAX_SEC:
-                fine_step = min(FINE_STEP_MAX_SEC, max(FINE_STEP_MIN_SEC, effective_mad))
+        if fine_eligible:
+            lat_width = max(FINE_WINDOW_MIN_SEC, 2.0 * float(latency_scale))
+            fine_start = next_api - timedelta(seconds=lat_width)
+            fine_end = next_api + timedelta(seconds=lat_width)
+
+            if fine_start <= now <= fine_end:
+                fine_step = max(
+                    FINE_STEP_MIN_SEC,
+                    min(FINE_STEP_MAX_SEC, lat_width / 4.0),
+                )
+                candidate = now + timedelta(seconds=float(fine_step))
             else:
-                fine_step = min_retry_seconds
-            next_fine = now + timedelta(seconds=fine_step)
-            if earliest_poll is None or next_fine < earliest_poll:
-                earliest_poll = next_fine
+                coarse_step = max(
+                    min_retry_seconds,
+                    mean_interval * COARSE_STEP_FRACTION,
+                )
+                target = fine_start if now < fine_start else next_api
+                candidate = max(
+                    now + timedelta(seconds=min_retry_seconds),
+                    min(
+                        target - timedelta(seconds=HEADSTART_SEC),
+                        now + timedelta(seconds=float(coarse_step)),
+                    ),
+                )
         else:
-            # Past the window: schedule based on next expected
-            next_expected = predicted + timedelta(seconds=interval)
-            if earliest_poll is None or next_expected < earliest_poll:
-                earliest_poll = next_expected
+            coarse_step = max(
+                min_retry_seconds,
+                mean_interval * COARSE_STEP_FRACTION,
+            )
+            candidate = max(
+                now + timedelta(seconds=min_retry_seconds),
+                min(
+                    next_api - timedelta(seconds=HEADSTART_SEC),
+                    now + timedelta(seconds=float(coarse_step)),
+                ),
+            )
 
-    if earliest_poll is None:
-        earliest_poll = now + timedelta(seconds=min_retry_seconds)
-    
-    # Never schedule in the past
-    if earliest_poll < now:
-        earliest_poll = now + timedelta(seconds=min_retry_seconds)
+        if candidate <= now:
+            candidate = now + timedelta(seconds=min_retry_seconds)
+        if best_time is None or candidate < best_time:
+            best_time = candidate
 
-    return earliest_poll
+    if best_time is None:
+        best_time = now + timedelta(seconds=DEFAULT_INTERVAL_SEC)
+
+    return best_time
 
 
 def control_summary(state: dict[str, Any], now: datetime) -> list[dict[str, Any]]:

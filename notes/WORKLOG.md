@@ -314,3 +314,9 @@ All 12 tests pass. Web deployment now loads from package.
   - `web_entrypoint.py` imports `streamvis.tui` directly (no reliance on `streamvis/__init__.py`).
   - `streamvis/tui.py` and `streamvis/state.py` import USGS adapter directly (no reliance on `streamvis/usgs/__init__.py`).
   - `web/main.js` treats `__init__.py`/`__main__.py` as optional during module fetch/install.
+
+## 2025-12-18 – Nearby First-Fetch: disable `modifiedSince` until seen
+
+- Fixed a Nearby UX glitch where newly discovered gauges could show blank fields on the first refresh due to WaterServices `modifiedSince` omitting stations we have never seen before.
+- `fetch_gauge_data()` now disables `modifiedSince` until every tracked gauge has at least one `last_timestamp` in state; after that, the bandwidth optimization can resume safely.
+- Added a regression test to keep this behavior stable (`tests/test_nearby.py`).

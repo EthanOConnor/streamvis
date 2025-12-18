@@ -270,3 +270,8 @@
   - Internal imports avoid `from streamvis.usgs import ...` re-exports (use `streamvis.usgs.adapter` directly).
   - `web/main.js` treats `__init__.py` and `__main__.py` as optional when fetching/installing Python files.
 - **Result**: The browser build can run either as a normal package (when `__init__.py` is present) or as a namespace package (when it’s not), without requiring site-level configuration changes.
+
+## 2025-12-18 – `modifiedSince` guard for newly tracked gauges
+
+- **Issue**: WaterServices `modifiedSince` can omit stations that have not changed recently. For newly added gauges (e.g., Nearby discovery) we may have no cached `last_*` values yet, so an omitted station renders as blank on the first fetch.
+- **Decision**: Disable `modifiedSince` until every currently tracked gauge has at least one `last_timestamp` in local state; after initial population, the UI can safely backfill omitted stations from cached values and the optimization can resume.

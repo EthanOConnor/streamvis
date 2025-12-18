@@ -191,6 +191,25 @@ def fetch_gauge_data(state: Dict[str, Any] | None = None) -> Dict[str, Dict[str,
             except Exception:
                 backend = USGSBackend.BLENDED
         modified_since_sec = _compute_modified_since_sec(state)
+        # If we are tracking any gauges that we have never successfully seen yet,
+        # disable modifiedSince so the first fetch can populate baseline values.
+        #
+        # This is especially important for Nearby-discovered gauges where we
+        # may not have any cached `last_*` values to backfill from state yet.
+        if modified_since_sec is not None:
+            gauges_state = state.get("gauges", {})
+            if not isinstance(gauges_state, dict):
+                modified_since_sec = None
+            else:
+                for gauge_id in SITE_MAP.keys():
+                    g_state = gauges_state.get(gauge_id)
+                    if not isinstance(g_state, dict):
+                        modified_since_sec = None
+                        break
+                    last_ts = g_state.get("last_timestamp")
+                    if not isinstance(last_ts, str) or not last_ts:
+                        modified_since_sec = None
+                        break
 
     try:
         readings, new_meta = _usgs_fetch_gauge_data(
